@@ -1,0 +1,28 @@
+{
+  "_note": "Rename to manual.json next to the server. Everything here is merged over the automated GA4 and Search Console data each day. Edit whenever the numbers change. Keys match the DASHBOARD object in the dashboard file.",
+
+  "linkedinFollowersByMonth": {
+    "2026-01": 1478,
+    "2026-02": 1512,
+    "2026-03": 1548,
+    "2026-04": 1579,
+    "2026-05": 1610,
+    "2026-06": 1644
+  },
+
+  "gbp": {
+    "interactions": 526,
+    "monthlyViews": 329,
+    "reviews": 33,
+    "rating": 4.5,
+    "breakdown": { "Website clicks": 214, "Direction requests": 148, "Calls": 104, "Messages": 60 }
+  },
+
+  "blogs": [],
+  "competitors": [],
+  "competitorOpps": [],
+  "competitorIdeas": [],
+  "websiteReview": {},
+  "ideas": {},
+  "linkedin": {}
+}

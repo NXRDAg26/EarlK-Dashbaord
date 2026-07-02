@@ -1,0 +1,19 @@
+{
+  "name": "ek-dashboard-service",
+  "version": "1.0.0",
+  "description": "Daily GA4 and Search Console data service for the Earl Kendrick dashboard",
+  "main": "ek-dashboard-server.js",
+  "scripts": {
+    "start": "node ek-dashboard-server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@google-analytics/data": "^4.7.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "googleapis": "^144.0.0",
+    "node-cron": "^3.0.3"
+  }
+}
