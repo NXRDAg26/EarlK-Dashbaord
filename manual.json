@@ -2,12 +2,12 @@
   "_note": "Rename to manual.json next to the server. Everything here is merged over the automated GA4 and Search Console data each day. Edit whenever the numbers change. Keys match the DASHBOARD object in the dashboard file.",
 
   "linkedinFollowersByMonth": {
-    "2026-01": 1478,
-    "2026-02": 1512,
-    "2026-03": 1548,
-    "2026-04": 1579,
-    "2026-05": 1610,
-    "2026-06": 1644
+    "2026-01": 2760,
+    "2026-02": 2810,
+    "2026-03": 2858,
+    "2026-04": 2905,
+    "2026-05": 2952,
+    "2026-06": 2998
   },
 
   "gbp": {
