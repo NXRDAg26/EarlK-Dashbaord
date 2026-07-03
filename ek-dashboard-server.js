@@ -3,55 +3,57 @@
 
    What this does
    --------------
-   Once a day it pulls the automatable figures from Google and LinkedIn, merges
-   in the parts that have to be entered by hand, and serves one JSON file that
-   the dashboard reads on load. Point the dashboard's DASHBOARD_DATA_URL at:
+   Once a day it pulls the automatable figures from Google, and the current
+   LinkedIn follower count, merges in the parts that are entered by hand, and
+   serves one JSON file the dashboard reads on load. Point the dashboard's
+   DASHBOARD_DATA_URL at:
 
        https://YOUR-RENDER-APP.onrender.com/api/ek-dashboard.json
 
-   and everyone, including the client, always sees the latest daily data.
-
    Automated here:   website visitors, sessions by channel, average time on
                      site (GA4), top search terms (Search Console), and the
-                     LinkedIn page numbers (followers, impressions, engagement).
-   Overlaid by hand: LinkedIn advocacy and top posts, Google Business Profile,
-                     competitors, ideas and the website review. Keep those in
-                     manual.json (see manual.sample.json) and edit when needed.
-                     Google Business Profile can be automated later via the
-                     Business Profile Performance API using the same pattern.
+                     LinkedIn follower total on the latest month.
+   Overlaid by hand: Google Business Profile, competitors, ideas, the website
+                     review, and the LinkedIn advocacy board. Keep those in
+                     manual.json and edit when needed.
 
-   How the LinkedIn merge behaves
-   ------------------------------
-   The API supplies the numeric fields it can (followers, impressions,
-   engagement rate). Your hand written fields in manual.json (advocacy, top
-   posts, anything else) sit on top and are never overwritten. If no LinkedIn
-   token is set, or the pull fails, the manual overlay stands on its own, so the
-   dashboard never goes blank.
+   Important: how LinkedIn is wired on this dashboard
+   --------------------------------------------------
+   The front end shows only one LinkedIn number from data: the follower KPI,
+   which reads months[].linkedinFollowers. So the API's single job here is to
+   keep that current. Historical months come from manual.linkedinFollowersByMonth;
+   the newest month is overwritten with the live count when a token is set.
+
+   This service deliberately does NOT emit a "linkedin" object. The front end
+   owns DASHBOARD.linkedin (the advocacy seed list and the best practice cards),
+   and the dashboard's merge replaces a whole object rather than deep merging, so
+   sending one from here would wipe those. The advocacy board is published
+   separately at /api/ek-advocacy.json (see below), which is what the front end's
+   ADVOCACY_DATA_URL is meant to point at.
 
    Setup
    -----
    1. npm init -y
    2. npm i express cors node-cron @google-analytics/data googleapis
       (no extra package for LinkedIn: fetch is built into Node 18 and above)
-   3. Create a Google Cloud service account, download its JSON key, and:
-        - add the service account email as a Viewer on the GA4 property
-        - add it as a user on the Search Console property
-   4. Set environment variables (in Render dashboard or a .env):
-        GOOGLE_APPLICATION_CREDENTIALS = ./service-account.json   (path to key)
-        GA4_PROPERTY_ID   = 123456789            (numbers only)
-        GSC_SITE_URL      = https://earlkendrick.com/   (or sc-domain:earlkendrick.com)
+   3. Google service account with Viewer on the GA4 property and access on the
+      Search Console property; download its JSON key.
+   4. Environment variables (Render dashboard or a .env):
+        GOOGLE_APPLICATION_CREDENTIALS = ./service-account.json
+        GA4_PROPERTY_ID   = 123456789
+        GSC_SITE_URL      = https://earlkendrick.com/
         PORT              = 3000
-      For the LinkedIn page numbers (optional, leave blank to stay manual):
+      LinkedIn follower count (optional, leave blank to stay on manual figures):
         LINKEDIN_ACCESS_TOKEN = your 60 day org access token
         LINKEDIN_ORG_URN      = urn:li:organization:12345
-        LINKEDIN_API_VERSION  = 202605           (optional, defaults below)
-   5. node ek-dashboard-server.js   (Render start command)
+        LINKEDIN_API_VERSION  = 202605
+   5. node ek-dashboard-server.js
 
    Note on the LinkedIn token
    --------------------------
    LinkedIn organisation tokens last about 60 days and Render has no durable
    disk, so refresh the token in the Render environment every couple of months.
-   Until a token is set the LinkedIn numbers come entirely from manual.json.
+   Until a token is set the follower figures come entirely from manual.json.
    ============================================================================= */
 
 const express = require('express');
@@ -66,7 +68,7 @@ const GA4_PROPERTY_ID = process.env.GA4_PROPERTY_ID || '381171366';
 const GSC_SITE_URL    = process.env.GSC_SITE_URL    || 'https://earlkendrick.com/';
 const PORT            = process.env.PORT || 3000;
 
-// LinkedIn (optional). Leave the token blank and the manual overlay is used.
+// LinkedIn (optional). Leave the token blank and the manual figures are used.
 const LI_TOKEN   = process.env.LINKEDIN_ACCESS_TOKEN || '';
 const LI_ORG_URN = process.env.LINKEDIN_ORG_URN || '';        // urn:li:organization:12345
 const LI_VERSION = process.env.LINKEDIN_API_VERSION || '202605';
@@ -88,7 +90,6 @@ function channelLabel(g){
 async function pullGA4(){
   const propertyId = `properties/${GA4_PROPERTY_ID}`;
 
-  // Users and average session duration by month
   const [totals] = await analytics.runReport({
     property: propertyId,
     dateRanges: [{ startDate: '182daysAgo', endDate: 'today' }],
@@ -97,7 +98,6 @@ async function pullGA4(){
     orderBys: [{ dimension: { dimensionName: 'yearMonth' } }]
   });
 
-  // Sessions by month and channel
   const [byChannel] = await analytics.runReport({
     property: propertyId,
     dateRanges: [{ startDate: '182daysAgo', endDate: 'today' }],
@@ -105,7 +105,7 @@ async function pullGA4(){
     metrics: [{ name: 'sessions' }]
   });
 
-  const byKey = {}; // "202606" -> month object
+  const byKey = {};
   (totals.rows || []).forEach(r => {
     const ym = r.dimensionValues[0].value;            // e.g. 202606
     const y = +ym.slice(0,4), mo = +ym.slice(4,6);
@@ -114,7 +114,7 @@ async function pullGA4(){
       label: `${MONTHS[mo-1]} ${y}`,
       users: Math.round(+r.metricValues[0].value),
       engagementSec: Math.round(+r.metricValues[1].value),
-      linkedinFollowers: 0,                             // filled from manual overlay
+      linkedinFollowers: 0,                             // filled from manual overlay + live count
       sources: {}
     };
   });
@@ -148,44 +148,27 @@ async function pullGSC(){
   })).sort((a,b) => b.clicks - a.clicks);
 }
 
-// ---- LinkedIn: page level numbers ------------------------------------------
-// Small GET helper with the mandatory version and protocol headers.
-async function liGet(q){
-  const res = await fetch('https://api.linkedin.com/rest' + q, {
+// ---- LinkedIn: current follower count only ---------------------------------
+// Returns the follower total, or null when no token is set so the manual
+// figures stand. Requires the r_organization_social or r_organization_followers
+// scope, granted after Marketing Developer Platform approval.
+// orgUrn looks like urn:li:organization:12345
+async function pullLinkedInFollowers(){
+  if (!LI_TOKEN || !LI_ORG_URN) return null;
+  const urn = encodeURIComponent(LI_ORG_URN);
+  const res = await fetch('https://api.linkedin.com/rest/networkSizes/' + urn + '?edgeType=CompanyFollowedByMember', {
     headers: {
       Authorization: 'Bearer ' + LI_TOKEN,
       'LinkedIn-Version': LI_VERSION,
       'X-Restli-Protocol-Version': '2.0.0'
     }
   });
-  if (!res.ok) throw new Error('LinkedIn ' + q + ' -> ' + res.status + ' ' + (await res.text()));
-  return res.json();
+  if (!res.ok) throw new Error('LinkedIn networkSizes -> ' + res.status + ' ' + (await res.text()));
+  const data = await res.json();
+  return data.firstDegreeSize != null ? data.firstDegreeSize : null;
 }
 
-// Returns the numeric fields the API can supply, or null when no token is set
-// so the manual overlay stands. Requires the r_organization_social and
-// r_organization_followers scopes, granted after Marketing Developer Platform
-// approval. orgUrn looks like urn:li:organization:12345
-async function pullLinkedIn(){
-  if (!LI_TOKEN || !LI_ORG_URN) return null;
-  const urn = encodeURIComponent(LI_ORG_URN);
-
-  const size  = await liGet(`/networkSizes/${urn}?edgeType=CompanyFollowedByMember`);
-  const share = await liGet(`/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${urn}`);
-  const s = (share.elements && share.elements[0] && share.elements[0].totalShareStatistics) || {};
-
-  return {
-    pageFollowers: size.firstDegreeSize != null ? size.firstDegreeSize : null,
-    impressions: s.impressionCount != null ? s.impressionCount : null,
-    clicks: s.clickCount != null ? s.clickCount : null,
-    reactions: s.likeCount != null ? s.likeCount : null,
-    comments: s.commentCount != null ? s.commentCount : null,
-    shares: s.shareCount != null ? s.shareCount : null,
-    engagementRate: s.engagement != null ? +(s.engagement * 100).toFixed(1) : null
-  };
-}
-
-// ---- Manual overlay (things Google/LinkedIn cannot auto feed) ---------------
+// ---- Manual overlay ---------------------------------------------------------
 function readManual(){
   try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'manual.json'), 'utf8')); }
   catch { return {}; }
@@ -194,14 +177,19 @@ function readManual(){
 // ---- Build the merged payload ----------------------------------------------
 async function buildData(){
   const manual = readManual();
-  let months = [], searchTerms = [], linkedinAuto = null;
+  let months = [], searchTerms = [], liFollowers = null;
   try { months = await pullGA4(); } catch (e) { console.error('GA4 pull failed:', e.message); }
   try { searchTerms = await pullGSC(); } catch (e) { console.error('GSC pull failed:', e.message); }
-  try { linkedinAuto = await pullLinkedIn(); } catch (e) { console.error('LinkedIn pull failed:', e.message); }
+  try { liFollowers = await pullLinkedInFollowers(); } catch (e) { console.error('LinkedIn pull failed:', e.message); }
 
-  // Merge LinkedIn follower totals from manual overlay onto the GA4 months
+  // Historical follower totals from the manual overlay
   const followersByKey = (manual.linkedinFollowersByMonth || {});
   months.forEach(m => { if (followersByKey[m.key] != null) m.linkedinFollowers = followersByKey[m.key]; });
+
+  // Live follower count overwrites the newest month, so the KPI self updates
+  if (liFollowers != null && months.length) {
+    months[months.length - 1].linkedinFollowers = liFollowers;
+  }
 
   const today = new Date();
   const lastUpdated = `${today.getDate()} ${MONTHS[today.getMonth()].slice(0,3)} ${today.getFullYear()}`;
@@ -212,19 +200,13 @@ async function buildData(){
   if (months.length) out.months = months;
   if (searchTerms.length) out.searchTerms = searchTerms;
 
-  // Everything else comes straight from the manual overlay
-  ['blogs','gbp','competitors','competitorOpps','competitorIdeas','websiteReview','ideas','linkedin']
+  // Pass the hand authored sections straight through. Note: "linkedin" is NOT
+  // in this list on purpose. The front end owns DASHBOARD.linkedin (advocacy
+  // seed and best practice), and the dashboard merge would replace that whole
+  // object, so this service must never send one. The advocacy board is served
+  // separately at /api/ek-advocacy.json below.
+  ['blogs','gbp','competitors','competitorOpps','competitorIdeas','shareOfVoice','websiteReview','ideas']
     .forEach(k => { if (manual[k] != null) out[k] = manual[k]; });
-
-  // LinkedIn API numbers go on last, layered over the manual linkedin object so
-  // hand written fields (advocacy, top posts) survive and only the numeric
-  // fields the API returned are overwritten. Nulls are dropped so a missing
-  // metric never blanks a value you entered by hand.
-  if (linkedinAuto) {
-    const clean = {};
-    Object.keys(linkedinAuto).forEach(k => { if (linkedinAuto[k] != null) clean[k] = linkedinAuto[k]; });
-    out.linkedin = Object.assign({}, out.linkedin || {}, clean);
-  }
 
   return out;
 }
@@ -241,6 +223,18 @@ cron.schedule('30 6 * * *', refresh);   // every day at 06:30 server time
 // ---- Serve ------------------------------------------------------------------
 const app = express();
 app.use(cors());                        // lets the dashboard on nx-rd.com read it
+
 app.get('/api/ek-dashboard.json', (_req, res) => res.json(cache));
+
+// Published LinkedIn advocacy board. The front end's ADVOCACY_DATA_URL points
+// here so the client sees the figures you authored, not their own local board.
+// Author locally in the dashboard (Add person, then Export data), then paste the
+// exported array into manual.json under "advocacyPublished" and redeploy.
+// Read live from manual.json so a redeploy publishes instantly.
+app.get('/api/ek-advocacy.json', (_req, res) => {
+  const manual = readManual();
+  res.json(Array.isArray(manual.advocacyPublished) ? manual.advocacyPublished : []);
+});
+
 app.get('/health', (_req, res) => res.send('ok'));
 app.listen(PORT, () => console.log('EK dashboard data service on :' + PORT));
