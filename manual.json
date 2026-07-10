@@ -1,5 +1,9 @@
 {
-  "_note": "Rename to manual.json next to the server. Everything here is merged over the automated GA4 and Search Console data each day. Edit whenever the numbers change. Keys match the DASHBOARD object in the dashboard file.",
+  "_note": "Rename to manual.json next to the server. Everything here is merged over the automated GA4 and Search Console data each day. Edit whenever the numbers change. Keys match the DASHBOARD object in the dashboard file. Empty arrays and objects are safe: the dashboard skips empties, so a section stays on whatever is written into the dashboard file until you fill it here.",
+
+  "_eventsNote": "Events (the Events tab: who is attending, merchandise, calendar) are NOT stored in this file. They are live data you and the PA edit through the day, so they live in Postgres and are served at /api/events. Nothing to add here for events.",
+
+  "_advocacyNote": "To publish the LinkedIn advocacy board to the client, author it in the dashboard (Add person, then Export data) and paste the exported array into advocacyPublished below, then redeploy. It is served at /api/ek-advocacy.json, which the dashboard's ADVOCACY_DATA_URL points at. Do not add a top level linkedin object here: the server never passes it through on purpose, because it would wipe the front end advocacy seed and best practice cards.",
 
   "linkedinFollowersByMonth": {
     "2026-01": 2760,
@@ -22,7 +26,9 @@
   "competitors": [],
   "competitorOpps": [],
   "competitorIdeas": [],
+  "shareOfVoice": [],
   "websiteReview": {},
   "ideas": {},
-  "linkedin": {}
+
+  "advocacyPublished": []
 }
