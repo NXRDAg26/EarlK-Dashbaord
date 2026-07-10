@@ -17,6 +17,22 @@
                      review, and the LinkedIn advocacy board. Keep those in
                      manual.json and edit when needed.
 
+   Shared events (NEW)
+   -------------------
+   The dashboard's Events tab reads and writes a single shared list, so you and
+   the PA see and edit the same events from anywhere. It is served here at:
+
+       GET  /api/events   returns the events array
+       PUT  /api/events   saves the events array (body = the whole array)
+
+   Events are stored in Postgres (Render has no durable disk, so a file would
+   not survive a restart). Point the dashboard's EVENTS_API at:
+
+       https://YOUR-RENDER-APP.onrender.com/api/events
+
+   If DATABASE_URL is not set the service still runs; the events routes simply
+   report no store, and the dashboard falls back to a per device local copy.
+
    Important: how LinkedIn is wired on this dashboard
    --------------------------------------------------
    The front end shows only one LinkedIn number from data: the follower KPI,
@@ -34,7 +50,7 @@
    Setup
    -----
    1. npm init -y
-   2. npm i express cors node-cron @google-analytics/data googleapis
+   2. npm i express cors node-cron @google-analytics/data googleapis pg
       (no extra package for LinkedIn: fetch is built into Node 18 and above)
    3. Google service account with Viewer on the GA4 property and access on the
       Search Console property; download its JSON key.
@@ -43,6 +59,8 @@
         GA4_PROPERTY_ID   = 123456789
         GSC_SITE_URL      = https://earlkendrick.com/
         PORT              = 3000
+      Shared events (who is attending, merchandise) that you and the PA edit:
+        DATABASE_URL      = your Postgres connection string (Render Postgres provides this)
       LinkedIn follower count (optional, leave blank to stay on manual figures):
         LINKEDIN_ACCESS_TOKEN = your 60 day org access token
         LINKEDIN_ORG_URN      = urn:li:organization:12345
@@ -63,6 +81,7 @@ const fs = require('fs');
 const path = require('path');
 const { BetaAnalyticsDataClient } = require('@google-analytics/data');
 const { google } = require('googleapis');
+const { Pool } = require('pg');
 
 const GA4_PROPERTY_ID = process.env.GA4_PROPERTY_ID || '381171366';
 const GSC_SITE_URL    = process.env.GSC_SITE_URL    || 'https://earlkendrick.com/';
@@ -75,6 +94,27 @@ const LI_VERSION = process.env.LINKEDIN_API_VERSION || '202605';
 
 const analytics = new BetaAnalyticsDataClient();          // uses GOOGLE_APPLICATION_CREDENTIALS
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+// ---- Shared events store (Postgres) ----------------------------------------
+// Optional: if DATABASE_URL is not set, the events routes report no store and
+// the dashboard keeps events locally per device. The whole list lives in one
+// JSON row, which is plenty for a small team. Last write wins.
+const DATABASE_URL = process.env.DATABASE_URL || '';
+const eventsPool = DATABASE_URL
+  ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : null;
+
+if (eventsPool) {
+  eventsPool.query(
+    `CREATE TABLE IF NOT EXISTS ek_events (
+       id   integer PRIMARY KEY DEFAULT 1,
+       data jsonb   NOT NULL DEFAULT '[]'::jsonb
+     )`
+  ).then(() => console.log('ek_events table ready'))
+   .catch(err => console.error('ek_events table error:', err.message));
+} else {
+  console.warn('DATABASE_URL not set: /api/events disabled, dashboard events stay local per device.');
+}
 
 // Map GA4 default channel groups to the labels the dashboard expects
 function channelLabel(g){
@@ -222,7 +262,7 @@ cron.schedule('30 6 * * *', refresh);   // every day at 06:30 server time
 
 // ---- Serve ------------------------------------------------------------------
 const app = express();
-app.use(cors());                        // lets the dashboard on nx-rd.com read it
+app.use(cors());                        // lets the dashboard on nx-rd.com read it (covers /api/events too)
 
 app.get('/api/ek-dashboard.json', (_req, res) => res.json(cache));
 
@@ -234,6 +274,37 @@ app.get('/api/ek-dashboard.json', (_req, res) => res.json(cache));
 app.get('/api/ek-advocacy.json', (_req, res) => {
   const manual = readManual();
   res.json(Array.isArray(manual.advocacyPublished) ? manual.advocacyPublished : []);
+});
+
+// ---- Shared events (Events tab) --------------------------------------------
+// GET returns the shared events array; PUT saves the whole array. The dashboard
+// posts the full list on every add, edit or delete, and polls GET to pick up
+// the other person's changes. Last write wins.
+app.get('/api/events', async (_req, res) => {
+  if (!eventsPool) return res.json([]);
+  try {
+    const { rows } = await eventsPool.query('SELECT data FROM ek_events WHERE id = 1');
+    res.json(rows[0] ? rows[0].data : []);
+  } catch (e) {
+    console.error('GET /api/events', e.message);
+    res.status(500).json([]);
+  }
+});
+
+app.put('/api/events', express.json({ limit: '1mb' }), async (req, res) => {
+  if (!eventsPool) return res.status(503).json({ ok: false, error: 'no database configured' });
+  try {
+    const data = Array.isArray(req.body) ? req.body : [];
+    await eventsPool.query(
+      `INSERT INTO ek_events (id, data) VALUES (1, $1)
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`,
+      [JSON.stringify(data)]
+    );
+    res.json({ ok: true, count: data.length });
+  } catch (e) {
+    console.error('PUT /api/events', e.message);
+    res.status(500).json({ ok: false });
+  }
 });
 
 app.get('/health', (_req, res) => res.send('ok'));
