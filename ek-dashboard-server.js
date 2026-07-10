@@ -81,7 +81,6 @@ const fs = require('fs');
 const path = require('path');
 const { BetaAnalyticsDataClient } = require('@google-analytics/data');
 const { google } = require('googleapis');
-const { Pool } = require('pg');
 
 const GA4_PROPERTY_ID = process.env.GA4_PROPERTY_ID || '381171366';
 const GSC_SITE_URL    = process.env.GSC_SITE_URL    || 'https://earlkendrick.com/';
@@ -100,18 +99,25 @@ const MONTHS = ['January','February','March','April','May','June','July','August
 // the dashboard keeps events locally per device. The whole list lives in one
 // JSON row, which is plenty for a small team. Last write wins.
 const DATABASE_URL = process.env.DATABASE_URL || '';
-const eventsPool = DATABASE_URL
-  ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
-  : null;
+let eventsPool = null;
 
-if (eventsPool) {
-  eventsPool.query(
-    `CREATE TABLE IF NOT EXISTS ek_events (
-       id   integer PRIMARY KEY DEFAULT 1,
-       data jsonb   NOT NULL DEFAULT '[]'::jsonb
-     )`
-  ).then(() => console.log('ek_events table ready'))
-   .catch(err => console.error('ek_events table error:', err.message));
+if (DATABASE_URL) {
+  try {
+    // Loaded here, not at the top, so the app still deploys if pg is not
+    // installed or no database is set. Run: npm i pg
+    const { Pool } = require('pg');
+    eventsPool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    eventsPool.query(
+      `CREATE TABLE IF NOT EXISTS ek_events (
+         id   integer PRIMARY KEY DEFAULT 1,
+         data jsonb   NOT NULL DEFAULT '[]'::jsonb
+       )`
+    ).then(() => console.log('ek_events table ready'))
+     .catch(err => console.error('ek_events table error:', err.message));
+  } catch (e) {
+    console.error('pg not available, /api/events disabled (run: npm i pg):', e.message);
+    eventsPool = null;
+  }
 } else {
   console.warn('DATABASE_URL not set: /api/events disabled, dashboard events stay local per device.');
 }
