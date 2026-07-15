@@ -9,12 +9,11 @@
   "engines": {
     "node": ">=18"
   },
-  "dependencies": {
+"dependencies": {
   "express": "^4",
   "cors": "^2",
   "node-cron": "^3",
   "@google-analytics/data": "^4",
   "googleapis": "^140",
   "pg": "^8"
-  }
 }
