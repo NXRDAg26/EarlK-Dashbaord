@@ -372,5 +372,28 @@ app.put('/api/linkedin', express.json({ limit: '2mb' }), async (req, res) => {
   }
 });
 
+// ---- Status: quick health readout for the shared stores ---------------------
+// Open https://YOUR-RENDER-APP.onrender.com/api/status in a browser.
+//   { "db": true,  "events": 3, "linkedin": 2 }  -> database connected, both saving
+//   { "db": false, ... }                          -> DATABASE_URL is not set on this
+//                                                     service, so nothing is shared.
+//                                                     Add it and redeploy.
+// A number is how many records are stored. If linkedin stays 0 after you add a
+// person in the dashboard, the save is not reaching this service.
+app.get('/api/status', async (_req, res) => {
+  const out = { db: !!eventsPool, events: null, linkedin: null };
+  if (eventsPool) {
+    try {
+      const e = await eventsPool.query(`SELECT COALESCE(jsonb_array_length(data),0) AS n FROM ek_events WHERE id = 1`);
+      out.events = e.rows[0] ? e.rows[0].n : 0;
+    } catch (err) { out.events = 'error: ' + err.message; }
+    try {
+      const l = await eventsPool.query(`SELECT COALESCE(jsonb_array_length(data),0) AS n FROM ek_linkedin WHERE id = 1`);
+      out.linkedin = l.rows[0] ? l.rows[0].n : 0;
+    } catch (err) { out.linkedin = 'error: ' + err.message; }
+  }
+  res.json(out);
+});
+
 app.get('/health', (_req, res) => res.send('ok'));
 app.listen(PORT, () => console.log('EK dashboard data service on :' + PORT));
