@@ -17,8 +17,8 @@
                      review, and the LinkedIn advocacy board. Keep those in
                      manual.json and edit when needed.
 
-   Shared events (NEW)
-   -------------------
+   Shared events
+   -------------
    The dashboard's Events tab reads and writes a single shared list, so you and
    the PA see and edit the same events from anywhere. It is served here at:
 
@@ -33,19 +33,38 @@
    If DATABASE_URL is not set the service still runs; the events routes simply
    report no store, and the dashboard falls back to a per device local copy.
 
+   Shared LinkedIn board (NEW)
+   ---------------------------
+   The dashboard's LinkedIn tab now logs each person's posts by hand (title,
+   date, likes, comments, reposts) and shows who is on track for one post a
+   week. That board is shared the same way as events, stored in Postgres, so
+   several people see and update the same figures:
+
+       GET  /api/linkedin   returns the people-with-posts array
+       PUT  /api/linkedin   saves the array (body = the whole array)
+
+   Point the dashboard's LINKEDIN_API at:
+
+       https://YOUR-RENDER-APP.onrender.com/api/linkedin
+
+   Like events, if DATABASE_URL is not set the routes report no store and the
+   dashboard falls back to a per device copy. This is separate from the daily
+   feed below, which still does NOT emit a "linkedin" object.
+
    Important: how LinkedIn is wired on this dashboard
    --------------------------------------------------
-   The front end shows only one LinkedIn number from data: the follower KPI,
-   which reads months[].linkedinFollowers. So the API's single job here is to
-   keep that current. Historical months come from manual.linkedinFollowersByMonth;
-   the newest month is overwritten with the live count when a token is set.
+   The front end shows only one LinkedIn number from the daily feed: the
+   follower KPI, which reads months[].linkedinFollowers. So the daily feed's
+   single LinkedIn job is to keep that current. Historical months come from
+   manual.linkedinFollowersByMonth; the newest month is overwritten with the
+   live count when a token is set.
 
-   This service deliberately does NOT emit a "linkedin" object. The front end
+   The daily feed deliberately does NOT emit a "linkedin" object. The front end
    owns DASHBOARD.linkedin (the advocacy seed list and the best practice cards),
    and the dashboard's merge replaces a whole object rather than deep merging, so
-   sending one from here would wipe those. The advocacy board is published
-   separately at /api/ek-advocacy.json (see below), which is what the front end's
-   ADVOCACY_DATA_URL is meant to point at.
+   sending one from the feed would wipe those. The manual posting board is now
+   served at /api/linkedin above. The older /api/ek-advocacy.json route is kept
+   for reference but the new LinkedIn tab uses /api/linkedin instead.
 
    Setup
    -----
@@ -59,7 +78,7 @@
         GA4_PROPERTY_ID   = 123456789
         GSC_SITE_URL      = https://earlkendrick.com/
         PORT              = 3000
-      Shared events (who is attending, merchandise) that you and the PA edit:
+      Shared events and the shared LinkedIn board (edited by you and the PA):
         DATABASE_URL      = your Postgres connection string (Render Postgres provides this)
       LinkedIn follower count (optional, leave blank to stay on manual figures):
         LINKEDIN_ACCESS_TOKEN = your 60 day org access token
@@ -94,10 +113,11 @@ const LI_VERSION = process.env.LINKEDIN_API_VERSION || '202605';
 const analytics = new BetaAnalyticsDataClient();          // uses GOOGLE_APPLICATION_CREDENTIALS
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
-// ---- Shared events store (Postgres) ----------------------------------------
-// Optional: if DATABASE_URL is not set, the events routes report no store and
-// the dashboard keeps events locally per device. The whole list lives in one
-// JSON row, which is plenty for a small team. Last write wins.
+// ---- Shared store (Postgres) -----------------------------------------------
+// Optional: if DATABASE_URL is not set, the events and linkedin routes report
+// no store and the dashboard keeps those tabs locally per device. Each shared
+// list lives in one JSON row, which is plenty for a small team. Last write wins.
+// One pool serves both the events table and the linkedin table.
 const DATABASE_URL = process.env.DATABASE_URL || '';
 let eventsPool = null;
 
@@ -114,12 +134,19 @@ if (DATABASE_URL) {
        )`
     ).then(() => console.log('ek_events table ready'))
      .catch(err => console.error('ek_events table error:', err.message));
+    eventsPool.query(
+      `CREATE TABLE IF NOT EXISTS ek_linkedin (
+         id   integer PRIMARY KEY DEFAULT 1,
+         data jsonb   NOT NULL DEFAULT '[]'::jsonb
+       )`
+    ).then(() => console.log('ek_linkedin table ready'))
+     .catch(err => console.error('ek_linkedin table error:', err.message));
   } catch (e) {
-    console.error('pg not available, /api/events disabled (run: npm i pg):', e.message);
+    console.error('pg not available, /api/events and /api/linkedin disabled (run: npm i pg):', e.message);
     eventsPool = null;
   }
 } else {
-  console.warn('DATABASE_URL not set: /api/events disabled, dashboard events stay local per device.');
+  console.warn('DATABASE_URL not set: /api/events and /api/linkedin disabled, those tabs stay local per device.');
 }
 
 // Map GA4 default channel groups to the labels the dashboard expects
@@ -249,8 +276,8 @@ async function buildData(){
   // Pass the hand authored sections straight through. Note: "linkedin" is NOT
   // in this list on purpose. The front end owns DASHBOARD.linkedin (advocacy
   // seed and best practice), and the dashboard merge would replace that whole
-  // object, so this service must never send one. The advocacy board is served
-  // separately at /api/ek-advocacy.json below.
+  // object, so this service must never send one. The manual posting board is
+  // served separately at /api/linkedin below.
   ['blogs','gbp','competitors','competitorOpps','competitorIdeas','shareOfVoice','websiteReview','ideas']
     .forEach(k => { if (manual[k] != null) out[k] = manual[k]; });
 
@@ -268,15 +295,14 @@ cron.schedule('30 6 * * *', refresh);   // every day at 06:30 server time
 
 // ---- Serve ------------------------------------------------------------------
 const app = express();
-app.use(cors());                        // lets the dashboard on nx-rd.com read it (covers /api/events too)
+app.use(cors());                        // lets the dashboard on nx-rd.com read it (covers /api/events and /api/linkedin too)
 
 app.get('/api/ek-dashboard.json', (_req, res) => res.json(cache));
 
-// Published LinkedIn advocacy board. The front end's ADVOCACY_DATA_URL points
-// here so the client sees the figures you authored, not their own local board.
-// Author locally in the dashboard (Add person, then Export data), then paste the
-// exported array into manual.json under "advocacyPublished" and redeploy.
-// Read live from manual.json so a redeploy publishes instantly.
+// Published LinkedIn advocacy board (legacy). The old advocacy scorer used
+// ADVOCACY_DATA_URL pointing here. The new LinkedIn tab uses /api/linkedin
+// instead, but this route is left in place so nothing that still reads it
+// breaks. Reads live from manual.json under "advocacyPublished".
 app.get('/api/ek-advocacy.json', (_req, res) => {
   const manual = readManual();
   res.json(Array.isArray(manual.advocacyPublished) ? manual.advocacyPublished : []);
@@ -309,6 +335,39 @@ app.put('/api/events', express.json({ limit: '1mb' }), async (req, res) => {
     res.json({ ok: true, count: data.length });
   } catch (e) {
     console.error('PUT /api/events', e.message);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// ---- Shared LinkedIn board (LinkedIn tab) ----------------------------------
+// Same pattern as events, on the same pool but its own table. GET returns the
+// people-with-posts array; PUT saves the whole array. The dashboard posts the
+// full list on every add, edit or delete, and polls GET to pick up other
+// people's changes. Last write wins. Limit is a little higher than events
+// because posts accumulate over time.
+app.get('/api/linkedin', async (_req, res) => {
+  if (!eventsPool) return res.json([]);
+  try {
+    const { rows } = await eventsPool.query('SELECT data FROM ek_linkedin WHERE id = 1');
+    res.json(rows[0] ? rows[0].data : []);
+  } catch (e) {
+    console.error('GET /api/linkedin', e.message);
+    res.status(500).json([]);
+  }
+});
+
+app.put('/api/linkedin', express.json({ limit: '2mb' }), async (req, res) => {
+  if (!eventsPool) return res.status(503).json({ ok: false, error: 'no database configured' });
+  try {
+    const data = Array.isArray(req.body) ? req.body : [];
+    await eventsPool.query(
+      `INSERT INTO ek_linkedin (id, data) VALUES (1, $1)
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`,
+      [JSON.stringify(data)]
+    );
+    res.json({ ok: true, count: data.length });
+  } catch (e) {
+    console.error('PUT /api/linkedin', e.message);
     res.status(500).json({ ok: false });
   }
 });
