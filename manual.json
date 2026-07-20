@@ -1,17 +1,47 @@
 {
-  "_note": "Rename to manual.json next to the server. Everything here is merged over the automated GA4 and Search Console data each day. Edit whenever the numbers change. Keys match the DASHBOARD object in the dashboard file. Empty arrays and objects are safe: the dashboard skips empties, so a section stays on whatever is written into the dashboard file until you fill it here.",
+  "_note": "Sits next to ek-dashboard-server.js. Everything here is merged over the automated GA4 and Search Console data on every refresh. Keys match the DASHBOARD object in the dashboard file. Empty arrays and objects are safe: the dashboard skips empties, so a section stays on whatever is written into the dashboard file until you fill it here.",
 
-  "_eventsNote": "Events (the Events tab: who is attending, merchandise, calendar) are NOT stored in this file. They are live data you and the PA edit through the day, so they live in Postgres and are served at /api/events. Nothing to add here for events.",
+  "_eventsNote": "Events are NOT stored in this file. They are live data edited through the day, so they live in Postgres and are served at /api/events.",
 
-  "_advocacyNote": "To publish the LinkedIn advocacy board to the client, author it in the dashboard (Add person, then Export data) and paste the exported array into advocacyPublished below, then redeploy. It is served at /api/ek-advocacy.json, which the dashboard's ADVOCACY_DATA_URL points at. Do not add a top level linkedin object here: the server never passes it through on purpose, because it would wipe the front end advocacy seed and best practice cards.",
+  "_advocacyNote": "To publish the LinkedIn advocacy board to the client, author it in the dashboard (Add person, then Export data) and paste the exported array into advocacyPublished below, then redeploy. Do not add a top level linkedin object here: the server never passes it through on purpose, because it would wipe the front end advocacy seed and best practice cards.",
+
+  "_followersNote": "The dashboard reads linkedinFollowers off every period for the KPI, its change chip and its sparkline. Add a month here as it closes. Weeks inherit their month automatically, so linkedinFollowersByWeek only needs filling if you want the KPI to move week on week rather than step once a month. Any period with no figure carries forward the last one known, so there are never zeros on the chart. When a LinkedIn token is set the newest period is overwritten with the live count.",
 
   "linkedinFollowersByMonth": {
+    "2025-08": 2540,
+    "2025-09": 2590,
+    "2025-10": 2645,
+    "2025-11": 2690,
+    "2025-12": 2718,
     "2026-01": 2760,
     "2026-02": 2810,
     "2026-03": 2858,
     "2026-04": 2905,
     "2026-05": 2952,
     "2026-06": 2998
+  },
+
+  "linkedinFollowersByWeek": {
+    "2026-W26": 2998,
+    "2026-W27": 3006,
+    "2026-W28": 3018,
+    "2026-W29": 3030
+  },
+
+  "_gbpNote": "Google Business Profile has no automated pull in this service, the Business Profile API needs separate approval, so these figures are entered by hand from the Performance tab. gbpByPeriod keys must match the period keys exactly, 2026-06 for a month and 2026-W29 for a week, or the tab silently falls back to the gbp object below. interactions and views are flows within the period. reviews and rating are running totals to date at the end of the period. breakdown should sum to interactions.",
+
+  "gbpByPeriod": {
+    "2026-01": { "interactions": 388, "views": 236, "reviews": 24, "rating": 4.4, "breakdown": { "Website clicks": 158, "Direction requests": 108, "Calls": 77,  "Messages": 45 } },
+    "2026-02": { "interactions": 415, "views": 252, "reviews": 26, "rating": 4.4, "breakdown": { "Website clicks": 169, "Direction requests": 116, "Calls": 82,  "Messages": 48 } },
+    "2026-03": { "interactions": 442, "views": 268, "reviews": 28, "rating": 4.5, "breakdown": { "Website clicks": 180, "Direction requests": 124, "Calls": 87,  "Messages": 51 } },
+    "2026-04": { "interactions": 470, "views": 285, "reviews": 29, "rating": 4.5, "breakdown": { "Website clicks": 192, "Direction requests": 131, "Calls": 93,  "Messages": 54 } },
+    "2026-05": { "interactions": 498, "views": 305, "reviews": 31, "rating": 4.5, "breakdown": { "Website clicks": 203, "Direction requests": 139, "Calls": 98,  "Messages": 58 } },
+    "2026-06": { "interactions": 526, "views": 329, "reviews": 33, "rating": 4.5, "breakdown": { "Website clicks": 214, "Direction requests": 148, "Calls": 104, "Messages": 60 } },
+
+    "2026-W26": { "interactions": 135, "views": 84, "reviews": 33, "rating": 4.5, "breakdown": { "Website clicks": 55, "Direction requests": 38, "Calls": 27, "Messages": 15 } },
+    "2026-W27": { "interactions": 131, "views": 82, "reviews": 33, "rating": 4.5, "breakdown": { "Website clicks": 54, "Direction requests": 37, "Calls": 26, "Messages": 14 } },
+    "2026-W28": { "interactions": 138, "views": 86, "reviews": 33, "rating": 4.5, "breakdown": { "Website clicks": 57, "Direction requests": 39, "Calls": 27, "Messages": 15 } },
+    "2026-W29": { "interactions": 141, "views": 88, "reviews": 33, "rating": 4.5, "breakdown": { "Website clicks": 58, "Direction requests": 40, "Calls": 28, "Messages": 15 } }
   },
 
   "gbp": {
