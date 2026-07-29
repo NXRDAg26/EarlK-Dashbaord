@@ -1130,6 +1130,34 @@ async function buildData(){
     if (gap(weeks))  fillFollowers(weeks,  byWeek,  byMonth, null);
   }
 
+  /* Counts typed into the dashboard itself, on the shared board. They fill any
+     period the API did not answer for, which is what keeps the followers KPI
+     moving while the Community Management access request is still with
+     LinkedIn. A measured figure always wins over a typed one. */
+  if (!li.ok) {
+    try {
+      const typed = await storeGet('followers');
+      const list = (typed && Array.isArray(typed.entries) ? typed.entries : [])
+        .filter(e => e && e.date && e.count != null)
+        .sort((a, b) => a.date < b.date ? -1 : 1);
+      if (list.length) {
+        const atOrBefore = endISO => {
+          let v = null;
+          list.forEach(e => { if (e.date <= endISO) v = +e.count; });
+          return v;
+        };
+        months.concat(weeks).forEach(p => {
+          const v = atOrBefore(p._range.end);
+          if (v != null) { p.linkedinFollowers = v; p.linkedinFollowersTyped = true; }
+        });
+        // Anything earlier than the first entry takes that first figure
+        const first = +list[0].count;
+        months.concat(weeks).forEach(p => { if (!p.linkedinFollowers) p.linkedinFollowers = first; });
+        diag.linkedin.typedEntries = list.length;
+      }
+    } catch (e) { console.error('Typed follower counts could not be read:', e.message); }
+  }
+
   // Mark each period so the dashboard can say which figures were measured
   const liLive = !!li.ok;
   months.concat(weeks).forEach(p => { p.linkedinLive = liLive && p.linkedinImpressions != null; });
@@ -1426,7 +1454,7 @@ app.put('/api/linkedin', express.json({ limit: '2mb' }), async (req, res) => {
 // ---- Status: quick health readout for the shared stores ---------------------
 // ---- Content plan, video library, competitor captures --------------------
 // Same shape as events: GET returns the array, PUT saves the whole array.
-['content', 'videos', 'competitors'].forEach(name => {
+['content', 'videos', 'competitors', 'followers'].forEach(name => {
   app.get('/api/' + name, async (_req, res) => {
     if (!eventsPool) return res.json([]);
     try {
@@ -1637,7 +1665,7 @@ app.get('/health', (_req, res) => res.send('ok'));
 app.get('/api/status/boards', async (_req, res) => {
   if (!eventsPool) return res.json({ db: false });
   const out = { db: true };
-  for (const k of ['content', 'videos', 'competitors']) {
+  for (const k of ['content', 'videos', 'competitors', 'followers']) {
     try {
       const r = await eventsPool.query(
         `SELECT COALESCE(jsonb_array_length(data), 0) AS n, updated_at FROM ek_store WHERE key = $1`, [k]);
