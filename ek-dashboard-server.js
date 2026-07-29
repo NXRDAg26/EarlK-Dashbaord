@@ -107,9 +107,23 @@ const GSC_LAG_DAYS    = Math.max(0, +(process.env.GSC_LAG_DAYS || 3));
    after setup. Leave the token blank and the manual figures are used instead. */
 let   LI_TOKEN    = process.env.LINKEDIN_ACCESS_TOKEN || '';
 const LI_REFRESH  = process.env.LINKEDIN_REFRESH_TOKEN || '';
+let   LI_SAVED_REFRESH = '';   // set when the connect page has been used
 const LI_CLIENT   = process.env.LINKEDIN_CLIENT_ID || '';
 const LI_SECRET   = process.env.LINKEDIN_CLIENT_SECRET || '';
-const LI_ORG_URN  = process.env.LINKEDIN_ORG_URN || '';
+/* The organisation can be given as the full URN, as the bare id, or as the
+   company page URL copied out of the address bar. All three are accepted and
+   normalised, because pasting the admin URL is the obvious thing to do and it
+   should not quietly fail. */
+function normaliseOrgUrn(raw){
+  const v = (raw || '').trim();
+  if (!v) return '';
+  if (/^urn:li:organization:\d+$/.test(v)) return v;
+  const m = v.match(/(?:company|organization)\/(\d+)/) || v.match(/^(\d+)$/);
+  if (m) return 'urn:li:organization:' + m[1];
+  console.error('LINKEDIN_ORG_URN could not be read: ' + v);
+  return '';
+}
+const LI_ORG_URN  = normaliseOrgUrn(process.env.LINKEDIN_ORG_URN);
 const LI_VERSION  = process.env.LINKEDIN_API_VERSION || '202606';
 
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
@@ -536,6 +550,209 @@ function gscIncomplete(period, today){
 }
 
 /* ---------------------------------------------------------------------------
+   TOKEN STORE
+   Access and refresh tokens are kept in the database rather than in an
+   environment variable, so authorising once survives every later redeploy.
+   --------------------------------------------------------------------------- */
+async function storeGet(key){
+  if (!eventsPool) return null;
+  try {
+    const { rows } = await eventsPool.query('SELECT data, updated_at FROM ek_store WHERE key = $1', [key]);
+    return rows.length ? Object.assign({}, rows[0].data, { _updatedAt: rows[0].updated_at }) : null;
+  } catch (e) { return null; }
+}
+async function storePut(key, obj){
+  if (!eventsPool) return false;
+  try {
+    await eventsPool.query(
+      `INSERT INTO ek_store (key, data, updated_at) VALUES ($1, $2::jsonb, now())
+       ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
+      [key, JSON.stringify(obj)]
+    );
+    return true;
+  } catch (e) { console.error('Could not save ' + key + ':', e.message); return false; }
+}
+
+/* ---------------------------------------------------------------------------
+   GOOGLE BUSINESS PROFILE
+   ---------------------------------------------------------------------------
+   The Business Profile APIs will not accept a service account or an API key.
+   They are user owned data, so they need OAuth against a Google account that
+   manages the listing, with the business.manage scope. On top of that, a new
+   Cloud project is given zero quota until Google approves a written access
+   request, so the calls return 403 until that lands.
+
+   All of it is built and ready. Authorise at /connect and the moment the quota
+   is granted the figures start arriving with no further work.
+   --------------------------------------------------------------------------- */
+const GOOGLE_CLIENT_ID     = process.env.GOOGLE_OAUTH_CLIENT_ID || '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_OAUTH_CLIENT_SECRET || '';
+const PUBLIC_URL           = (process.env.PUBLIC_URL || process.env.SELF_URL || '').replace(/\/$/, '');
+const GBP_LOCATION_ID      = process.env.GBP_LOCATION_ID || '';        // digits only, no "locations/"
+const GBP_SCOPE            = 'https://www.googleapis.com/auth/business.manage';
+
+const GBP_METRICS = [
+  'BUSINESS_IMPRESSIONS_DESKTOP_MAPS',
+  'BUSINESS_IMPRESSIONS_DESKTOP_SEARCH',
+  'BUSINESS_IMPRESSIONS_MOBILE_MAPS',
+  'BUSINESS_IMPRESSIONS_MOBILE_SEARCH',
+  'WEBSITE_CLICKS',
+  'CALL_CLICKS',
+  'BUSINESS_DIRECTION_REQUESTS',
+  'BUSINESS_CONVERSATIONS'
+];
+// Which of the above are views of the listing, and which are actions taken on it
+const GBP_VIEW_METRICS = GBP_METRICS.filter(m => m.startsWith('BUSINESS_IMPRESSIONS'));
+const GBP_ACTION_LABEL = {
+  WEBSITE_CLICKS: 'Website clicks',
+  BUSINESS_DIRECTION_REQUESTS: 'Direction requests',
+  CALL_CLICKS: 'Calls',
+  BUSINESS_CONVERSATIONS: 'Messages'
+};
+
+async function googleAccessToken(){
+  const saved = await storeGet('google_token');
+  if (!saved || !saved.refresh_token) return null;
+  // Reuse an access token that has not expired yet
+  if (saved.access_token && saved.expires_at && Date.now() < saved.expires_at - 60000) return saved.access_token;
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) return null;
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: saved.refresh_token,
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET
+    })
+  });
+  if (!res.ok) { console.error('Google token refresh failed:', res.status, await res.text()); return null; }
+  const d = await res.json();
+  if (!d.access_token) return null;
+  await storePut('google_token', {
+    refresh_token: saved.refresh_token,
+    access_token: d.access_token,
+    expires_at: Date.now() + (d.expires_in || 3600) * 1000
+  });
+  return d.access_token;
+}
+
+async function gApi(url, token){
+  const res = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
+  const text = await res.text();
+  if (!res.ok) {
+    let hint = '';
+    if (res.status === 403 && /quota|PERMISSION_DENIED/i.test(text)) {
+      hint = ' (this is the access request gate: the project has no quota until Google approves the form at support.google.com/business/contact/api_default)';
+    }
+    throw new Error(res.status + ' ' + text.slice(0, 300) + hint);
+  }
+  try { return JSON.parse(text); } catch (e) { return {}; }
+}
+
+// Work out which listing to read. An explicit id wins, otherwise the first one
+// the authorised account manages is used.
+async function gbpResolveLocation(token){
+  if (GBP_LOCATION_ID) return { id: GBP_LOCATION_ID.replace(/^locations\//, ''), name: null };
+  const accts = await gApi('https://mybusinessaccountmanagement.googleapis.com/v1/accounts', token);
+  const acct = (accts.accounts || [])[0];
+  if (!acct) throw new Error('the authorised Google account manages no Business Profile accounts');
+  const locs = await gApi(
+    'https://mybusinessbusinessinformation.googleapis.com/v1/' + acct.name +
+    '/locations?readMask=name,title&pageSize=10', token);
+  const loc = (locs.locations || [])[0];
+  if (!loc) throw new Error('no locations found on ' + acct.name);
+  return { id: loc.name.replace(/^locations\//, ''), name: loc.title || null, account: acct.name };
+}
+
+function dateParams(prefix, isoDate){
+  const [y, m, d] = isoDate.split('-').map(Number);
+  return `${prefix}.year=${y}&${prefix}.month=${m}&${prefix}.day=${d}`;
+}
+
+async function gbpDaily(token, locationId, startISO, endISO){
+  const url = 'https://businessprofileperformance.googleapis.com/v1/locations/' + locationId +
+    ':fetchMultiDailyMetricsTimeSeries?' +
+    GBP_METRICS.map(m => 'dailyMetrics=' + m).join('&') + '&' +
+    dateParams('dailyRange.start_date', startISO) + '&' +
+    dateParams('dailyRange.end_date', endISO);
+
+  const d = await gApi(url, token);
+  const byDay = {};                                   // "2026-07-14" -> { metric: value }
+  (d.multiDailyMetricTimeSeries || []).forEach(group => {
+    (group.dailyMetricTimeSeries || []).forEach(series => {
+      const metric = series.dailyMetric;
+      const points = (series.timeSeries && series.timeSeries.datedValues) || [];
+      points.forEach(pt => {
+        const dt = pt.date || {};
+        if (!dt.year) return;
+        const key = dt.year + '-' + pad2(dt.month) + '-' + pad2(dt.day);
+        (byDay[key] = byDay[key] || {})[metric] = (byDay[key][metric] || 0) + (+pt.value || 0);
+      });
+    });
+  });
+  return byDay;
+}
+
+// Reviews and the star rating still only come from the older v4 endpoint
+async function gbpReviews(token, account, locationId){
+  if (!account) return null;
+  const d = await gApi('https://mybusiness.googleapis.com/v4/' + account + '/locations/' + locationId + '/reviews?pageSize=1', token);
+  return {
+    reviews: d.totalReviewCount != null ? d.totalReviewCount : null,
+    rating: d.averageRating != null ? +(+d.averageRating).toFixed(1) : null
+  };
+}
+
+/* Rolls the daily figures up into the same period keys the rest of the
+   dashboard uses, in the shape the Google Business tab already reads. */
+async function pullGbp(months, weeks){
+  const out = { ok: false, error: null, byPeriod: {}, location: null };
+  const token = await googleAccessToken();
+  if (!token) { out.error = 'not connected, authorise at /connect'; return out; }
+
+  let loc;
+  try { loc = await gbpResolveLocation(token); out.location = loc.name || loc.id; }
+  catch (e) { out.error = e.message; return out; }
+
+  const all = months.concat(weeks);
+  if (!all.length) { out.error = 'no periods to report on'; return out; }
+  const start = all.map(p => p._range.start).sort()[0];
+  const end   = all.map(p => p._range.end).sort().slice(-1)[0];
+
+  let byDay;
+  try { byDay = await gbpDaily(token, loc.id, start, end); }
+  catch (e) { out.error = e.message; return out; }
+
+  let reviews = { reviews: null, rating: null };
+  try { const r = await gbpReviews(token, loc.account, loc.id); if (r) reviews = r; }
+  catch (e) { console.error('GBP reviews unavailable:', e.message); }
+
+  all.forEach(p => {
+    const bucket = { views: 0, interactions: 0, breakdown: {} };
+    Object.values(GBP_ACTION_LABEL).forEach(l => { bucket.breakdown[l] = 0; });
+    for (let t = new Date(p._range.start + 'T00:00:00Z').getTime();
+         t <= new Date(p._range.end + 'T00:00:00Z').getTime(); t += 86400000) {
+      const day = byDay[new Date(t).toISOString().slice(0, 10)];
+      if (!day) continue;
+      GBP_VIEW_METRICS.forEach(m => { bucket.views += day[m] || 0; });
+      Object.keys(GBP_ACTION_LABEL).forEach(m => {
+        const v = day[m] || 0;
+        bucket.interactions += v;
+        bucket.breakdown[GBP_ACTION_LABEL[m]] += v;
+      });
+    }
+    if (reviews.reviews != null) bucket.reviews = reviews.reviews;
+    if (reviews.rating != null)  bucket.rating = reviews.rating;
+    out.byPeriod[p.key] = bucket;
+  });
+
+  out.ok = Object.keys(out.byPeriod).length > 0;
+  return out;
+}
+
+/* ---------------------------------------------------------------------------
    LINKEDIN, live
    ---------------------------------------------------------------------------
    Three calls against the Community Management API:
@@ -556,10 +773,10 @@ function gscIncomplete(period, today){
 const LI_BASE = 'https://api.linkedin.com/rest/';
 
 async function refreshLinkedInToken(){
-  if (!LI_REFRESH || !LI_CLIENT || !LI_SECRET) return false;
+  if ((!LI_REFRESH && !LI_SAVED_REFRESH) || !LI_CLIENT || !LI_SECRET) return false;
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
-    refresh_token: LI_REFRESH,
+    refresh_token: LI_SAVED_REFRESH || LI_REFRESH,
     client_id: LI_CLIENT,
     client_secret: LI_SECRET
   });
@@ -595,6 +812,7 @@ async function loadSavedLinkedInToken(){
       const savedAt = new Date(rows[0].updated_at).getTime();
       // Only trust it if it is newer than 55 days, otherwise let the refresh run
       if (Date.now() - savedAt < 55 * 86400000) LI_TOKEN = rows[0].data.access_token;
+      if (rows[0].data.refresh_token) LI_SAVED_REFRESH = rows[0].data.refresh_token;
     }
   } catch (e) { /* table may not exist yet on a first run */ }
 }
@@ -700,12 +918,14 @@ async function liPageViews(urn, startISO, endISO, granularity, keyOf){
    overlay, rather than zeroing it. */
 async function pullLinkedIn(months, weeks){
   const result = { ok: false, followers: null, error: null, detail: {} };
+  await loadSavedLinkedInToken();
+
   if (!LI_TOKEN || !LI_ORG_URN) {
-    result.error = 'no token or organisation URN set, manual figures in use';
+    result.error = !LI_ORG_URN
+      ? 'LINKEDIN_ORG_URN is not set, manual figures in use'
+      : 'not connected, authorise at /connect';
     return result;
   }
-
-  await loadSavedLinkedInToken();
 
   // Lifetime count first. If this fails nothing else will work either.
   try {
@@ -829,6 +1049,7 @@ let diag = {
   ga4:      { ok: false, months: 0, weeks: 0, error: null },
   gsc:      { ok: false, periodsWithTerms: 0, error: null },
   blogs:    { ok: false, count: 0, error: null },
+  gbp:      { ok: false, periods: 0, location: null, error: null },
   linkedin: { ok: false, followers: null, error: null },
   manual:   { gbpByPeriod: 0, keys: [] }
 };
@@ -913,6 +1134,16 @@ async function buildData(){
   const liLive = !!li.ok;
   months.concat(weeks).forEach(p => { p.linkedinLive = liLive && p.linkedinImpressions != null; });
 
+  // ---- Google Business Profile ----
+  let gbp = { ok: false, error: 'not attempted', byPeriod: {}, location: null };
+  try {
+    gbp = await pullGbp(months, weeks);
+    diag.gbp = { ok: gbp.ok, periods: Object.keys(gbp.byPeriod).length, location: gbp.location, error: gbp.error };
+  } catch (e) {
+    diag.gbp = { ok: false, periods: 0, location: null, error: e.message };
+    console.error('Google Business pull failed:', e.message);
+  }
+
   // ---- News articles ----
   let blogs = null;
   try {
@@ -936,6 +1167,13 @@ async function buildData(){
   if (weeks.length)  out.weeks  = weeks;
   if (latestTerms.length) out.searchTerms = latestTerms;
   if (blogs && blogs.length) out.blogs = blogs;          // live, overrides the manual list below
+  if (gbp.ok) {
+    out.gbpByPeriod = gbp.byPeriod;                      // live, overrides the manual list below
+    const newest = months.length ? months[months.length - 1].key : null;
+    const n = newest && gbp.byPeriod[newest];
+    if (n) out.gbp = { interactions: n.interactions, monthlyViews: n.views, reviews: n.reviews, rating: n.rating, breakdown: n.breakdown };
+    out.gbpLive = true;
+  }
   out.linkedinLive = !!(li && li.ok);
   if (li && li.followers != null) out.linkedinFollowersNow = li.followers;
 
@@ -946,6 +1184,7 @@ async function buildData(){
   ['blogs','gbp','gbpByPeriod','competitors','competitorOpps','competitorIdeas','shareOfVoice','websiteReview','ideas']
     .forEach(k => {
       if (k === 'blogs' && out.blogs) return;            // the live list wins
+      if ((k === 'gbp' || k === 'gbpByPeriod') && gbp.ok) return;
       const v = manual[k];
       if (v == null) return;
       // An empty array or object from manual.json used to be sent as though it
@@ -968,6 +1207,7 @@ async function buildData(){
     ga4: diag.ga4.ok ? `${diag.ga4.months} months, ${diag.ga4.weeks} weeks` : 'FAILED: ' + diag.ga4.error,
     gsc: diag.gsc.ok ? `${diag.gsc.periodsWithTerms} periods with terms` : 'FAILED: ' + diag.gsc.error,
     blogs: diag.blogs.ok ? `${diag.blogs.count} articles` : 'FAILED: ' + diag.blogs.error,
+    gbp: diag.gbp.ok ? `${diag.gbp.periods} periods from ${diag.gbp.location}` : 'not live: ' + diag.gbp.error,
     linkedin: diag.linkedin.ok
       ? `${diag.linkedin.followers} followers, ` + JSON.stringify(diag.linkedin.detail || {})
       : diag.linkedin.error
@@ -1065,7 +1305,7 @@ cron.schedule('30 6 * * *', refresh);   // every day at 06:30 UK time
    figures. Pinging itself every ten minutes keeps it awake on Render's free
    plan. Set SELF_URL to the service address to switch this on, or leave it
    blank if the service is on a paid plan that does not sleep. */
-const SELF_URL = process.env.SELF_URL || '';
+const SELF_URL = process.env.SELF_URL || PUBLIC_URL || '';
 if (SELF_URL) {
   setInterval(() => {
     fetch(SELF_URL.replace(/\/$/, '') + '/health').catch(() => {});
@@ -1103,7 +1343,13 @@ app.get('/api/diagnostics', (_req, res) => {
     servingPeriods: { months: (cache.months || []).length, weeks: (cache.weeks || []).length },
     newestWeek: cache.weeks && cache.weeks.length ? cache.weeks[cache.weeks.length - 1].label : null,
     newestMonth: cache.months && cache.months.length ? cache.months[cache.months.length - 1].label : null,
-    config: { GA4_PROPERTY_ID, GSC_SITE_URL, WEEKS_BACK, MONTHS_BACK, database: !!eventsPool }
+    config: {
+      GA4_PROPERTY_ID, GSC_SITE_URL, WEEKS_BACK, MONTHS_BACK,
+      database: !!eventsPool,
+      publicUrl: PUBLIC_URL || 'NOT SET',
+      linkedinOrg: LI_ORG_URN || 'NOT SET or could not be read',
+      googleOauth: GOOGLE_CLIENT_ID ? 'configured' : 'NOT SET'
+    }
   });
 });
 
@@ -1232,6 +1478,157 @@ app.get('/api/status', async (_req, res) => {
     } catch (err) { out.linkedin = 'error: ' + err.message; }
   }
   res.json(out);
+});
+
+/* ---------------------------------------------------------------------------
+   CONNECT
+   One page with a button for each account. Authorise once and the refresh
+   token is stored in the database, so it survives every redeploy.
+   --------------------------------------------------------------------------- */
+const LI_SCOPES = 'r_organization_social,rw_organization_admin';
+const redirectUri = which => (PUBLIC_URL || '') + '/auth/' + which + '/callback';
+
+function page(title, body){
+  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<style>
+ body{font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#F4F7FA;color:#132234;margin:0;padding:40px 20px}
+ .w{max-width:660px;margin:0 auto}
+ h1{font-size:23px;letter-spacing:-.02em;margin:0 0 6px}
+ .sub{color:#4C5A6A;margin:0 0 28px;font-size:14px}
+ .card{background:#fff;border:1px solid #E3EAF2;border-radius:16px;padding:22px;margin-bottom:16px}
+ .card h2{font-size:16px;margin:0 0 4px}
+ .state{display:inline-block;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;padding:3px 9px;border-radius:7px;margin-bottom:10px}
+ .on{background:rgba(23,158,94,.1);color:#137a49;border:1px solid rgba(23,158,94,.35)}
+ .off{background:rgba(210,72,59,.08);color:#D2483B;border:1px solid rgba(210,72,59,.3)}
+ p{margin:0 0 12px;font-size:13.6px;color:#4C5A6A}
+ a.btn{display:inline-block;background:#00A7E0;color:#fff;text-decoration:none;padding:10px 18px;border-radius:10px;font-size:14px;font-weight:600}
+ a.btn.grey{background:#EEF3F8;color:#132234;border:1px solid #E3EAF2}
+ code{background:#EEF3F8;padding:2px 6px;border-radius:5px;font-size:12.5px;word-break:break-all}
+ ol{font-size:13.6px;color:#4C5A6A;padding-left:20px} li{margin-bottom:7px}
+</style><div class="w">${body}</div>`;
+}
+
+app.get('/connect', async (_req, res) => {
+  const g = await storeGet('google_token');
+  const l = await storeGet('linkedin_token');
+  const ready = PUBLIC_URL ? '' : '<p style="color:#D2483B"><b>Set PUBLIC_URL first</b> in the Render environment, to this service address, or the sign in cannot come back here.</p>';
+
+  res.send(page('Connect the dashboard accounts', `
+    <h1>Connect the dashboard accounts</h1>
+    <p class="sub">Authorise once for each. The tokens are stored in the database and renewed automatically, so this does not need doing again.</p>
+    ${ready}
+
+    <div class="card">
+      <span class="state ${l ? 'on' : 'off'}">${l ? 'Connected' : 'Not connected'}</span>
+      <h2>LinkedIn company page</h2>
+      <p>Follower count, follower gains, impressions, clicks, engagement rate and page views. Needs an app with Community Management API access, and you must sign in as a super admin of the page.</p>
+      ${l ? `<p>Authorised ${new Date(l._updatedAt).toLocaleString('en-GB')}.</p>` : ''}
+      ${LI_CLIENT ? `<a class="btn ${l ? 'grey' : ''}" href="/auth/linkedin">${l ? 'Reconnect LinkedIn' : 'Connect LinkedIn'}</a>`
+                  : '<p style="color:#D2483B">Set LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET in Render first.</p>'}
+      <p style="margin-top:14px">Redirect URL to paste into the LinkedIn app: <code>${redirectUri('linkedin')}</code></p>
+    </div>
+
+    <div class="card">
+      <span class="state ${g ? 'on' : 'off'}">${g ? 'Connected' : 'Not connected'}</span>
+      <h2>Google Business Profile</h2>
+      <p>Listing views, website clicks, direction requests, calls, messages, review count and star rating. Sign in as the owner of the listing, not a manager.</p>
+      ${g ? `<p>Authorised ${new Date(g._updatedAt).toLocaleString('en-GB')}.</p>` : ''}
+      ${GOOGLE_CLIENT_ID ? `<a class="btn ${g ? 'grey' : ''}" href="/auth/google">${g ? 'Reconnect Google' : 'Connect Google'}</a>`
+                         : '<p style="color:#D2483B">Set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET in Render first.</p>'}
+      <p style="margin-top:14px">Redirect URL to paste into the Google OAuth client: <code>${redirectUri('google')}</code></p>
+      <p><b>Authorising is not enough on its own.</b> Google gives a new Cloud project no quota for these APIs until a written request is approved, so the calls answer 403 until then. Submit the form at <code>support.google.com/business/contact/api_default</code> signed in as the listing owner, with the Cloud project number and the use case. It usually takes one to two weeks. Everything here is already built, so the figures start arriving on their own the moment the quota is granted.</p>
+    </div>
+
+    <div class="card">
+      <h2>Check it is working</h2>
+      <ol>
+        <li><a href="/api/diagnostics">/api/diagnostics</a> names any pull that failed and why</li>
+        <li><a href="/api/status">/api/status</a> says whether real figures are being served</li>
+        <li>POST to <code>/api/refresh</code> to rebuild straight away rather than waiting for the morning run</li>
+      </ol>
+    </div>`));
+});
+
+app.get('/auth/google', (_req, res) => {
+  if (!GOOGLE_CLIENT_ID || !PUBLIC_URL) return res.status(400).send(page('Not configured', '<h1>Set GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET and PUBLIC_URL first.</h1>'));
+  const url = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: redirectUri('google'),
+    response_type: 'code',
+    scope: GBP_SCOPE,
+    access_type: 'offline',
+    prompt: 'consent'                       // force a refresh token, every time
+  });
+  res.redirect(url);
+});
+
+app.get('/auth/google/callback', async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send(page('No code', '<h1>Google did not send an authorisation code.</h1><p>' + (req.query.error || '') + '</p>'));
+  try {
+    const r = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code, client_id: GOOGLE_CLIENT_ID, client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: redirectUri('google'), grant_type: 'authorization_code'
+      })
+    });
+    const d = await r.json();
+    if (!d.refresh_token) throw new Error('no refresh token returned: ' + JSON.stringify(d).slice(0, 300));
+    await storePut('google_token', {
+      refresh_token: d.refresh_token,
+      access_token: d.access_token || null,
+      expires_at: Date.now() + (d.expires_in || 3600) * 1000
+    });
+    refresh();
+    res.send(page('Google connected', '<h1>Google Business Profile connected</h1><p>The dashboard is rebuilding now. If the quota request has not been approved yet the Google Business figures will still show as not live, and will start on their own once it is.</p><a class="btn" href="/connect">Back to connections</a>'));
+  } catch (e) {
+    res.status(500).send(page('Failed', '<h1>Could not complete the Google sign in</h1><p><code>' + e.message + '</code></p><a class="btn grey" href="/connect">Try again</a>'));
+  }
+});
+
+app.get('/auth/linkedin', (_req, res) => {
+  if (!LI_CLIENT || !PUBLIC_URL) return res.status(400).send(page('Not configured', '<h1>Set LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET and PUBLIC_URL first.</h1>'));
+  const url = 'https://www.linkedin.com/oauth/v2/authorization?' + new URLSearchParams({
+    response_type: 'code',
+    client_id: LI_CLIENT,
+    redirect_uri: redirectUri('linkedin'),
+    scope: LI_SCOPES,
+    state: 'ek' + Date.now()
+  });
+  res.redirect(url);
+});
+
+app.get('/auth/linkedin/callback', async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send(page('No code', '<h1>LinkedIn did not send an authorisation code.</h1><p>' + (req.query.error_description || req.query.error || '') + '</p>'));
+  try {
+    const r = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code', code,
+        redirect_uri: redirectUri('linkedin'),
+        client_id: LI_CLIENT, client_secret: LI_SECRET
+      })
+    });
+    const d = await r.json();
+    if (!d.access_token) throw new Error(JSON.stringify(d).slice(0, 300));
+    LI_TOKEN = d.access_token;
+    await storePut('linkedin_token', {
+      access_token: d.access_token,
+      refresh_token: d.refresh_token || null,
+      renewedAt: new Date().toISOString()
+    });
+    refresh();
+    res.send(page('LinkedIn connected', '<h1>LinkedIn connected</h1><p>The dashboard is rebuilding now. Open the LinkedIn tab in a minute and the company page figures should be there.</p>' +
+      (d.refresh_token ? '' : '<p><b>Note.</b> LinkedIn did not return a refresh token, which means the app does not have that turned on. The access token will expire in 60 days and will need reconnecting here.</p>') +
+      '<a class="btn" href="/connect">Back to connections</a>'));
+  } catch (e) {
+    res.status(500).send(page('Failed', '<h1>Could not complete the LinkedIn sign in</h1><p><code>' + e.message + '</code></p><a class="btn grey" href="/connect">Try again</a>'));
+  }
 });
 
 app.get('/health', (_req, res) => res.send('ok'));
