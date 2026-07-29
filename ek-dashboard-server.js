@@ -100,10 +100,17 @@ const GSC_ROWS        = Math.max(5, +(process.env.GSC_ROWS || 25));
 // that window is incomplete and is flagged rather than quietly under reported.
 const GSC_LAG_DAYS    = Math.max(0, +(process.env.GSC_LAG_DAYS || 3));
 
-// LinkedIn (optional). Leave the token blank and the manual figures are used.
-const LI_TOKEN   = process.env.LINKEDIN_ACCESS_TOKEN || '';
-const LI_ORG_URN = process.env.LINKEDIN_ORG_URN || '';
-const LI_VERSION = process.env.LINKEDIN_API_VERSION || '202605';
+/* LinkedIn.
+   LINKEDIN_ACCESS_TOKEN lasts 60 days. Set LINKEDIN_REFRESH_TOKEN, along with
+   the client id and secret, and the service renews it on its own and writes the
+   new one to the database, so the figures do not quietly go stale two months
+   after setup. Leave the token blank and the manual figures are used instead. */
+let   LI_TOKEN    = process.env.LINKEDIN_ACCESS_TOKEN || '';
+const LI_REFRESH  = process.env.LINKEDIN_REFRESH_TOKEN || '';
+const LI_CLIENT   = process.env.LINKEDIN_CLIENT_ID || '';
+const LI_SECRET   = process.env.LINKEDIN_CLIENT_SECRET || '';
+const LI_ORG_URN  = process.env.LINKEDIN_ORG_URN || '';
+const LI_VERSION  = process.env.LINKEDIN_API_VERSION || '202606';
 
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 const MON3   = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -389,12 +396,110 @@ async function ga4Period(period){
     sessions,                     // the dashboard checks this against the channel split
     engagedSessions: engagedSess,
     engagementRate: sessions ? +(engagedSess / sessions * 100).toFixed(1) : 0,
+    _range: { start: period.start, end: period.end },
     partial: !!period.partial,
     daysElapsed: period.daysElapsed || null,
     daysInPeriod: period.daysInPeriod || null,
     linkedinFollowers: 0,        // filled from the manual overlay and the live count
     sources
   };
+}
+
+/* ---------------------------------------------------------------------------
+   NEWS ARTICLES, live from GA4
+   ---------------------------------------------------------------------------
+   The article table was a hand written list in manual.json, so the view counts
+   only moved when someone edited the file. This reads the news pages straight
+   out of GA4. Publication dates are not something Analytics knows, so those are
+   still taken from manual.json where they exist, matched on the URL.
+   --------------------------------------------------------------------------- */
+const BLOG_POSTS_URL = process.env.BLOG_POSTS_URL || 'https://earlkendrick.com/wp-json/wp/v2/posts';
+const BLOG_DAYS      = Math.max(7, +(process.env.BLOG_DAYS || 90));
+const BLOG_LIMIT     = Math.max(3, +(process.env.BLOG_LIMIT || 12));
+
+const pathOf = u => {
+  try { return new URL(u).pathname.replace(/\/$/, '') || '/'; }
+  catch (e) { return (u || '').replace(/^https?:\/\/[^/]+/, '').replace(/\/$/, ''); }
+};
+const dateLabel = d => d.getDate() + ' ' + MON3[d.getMonth()] + ' ' + d.getFullYear();
+
+/* The articles sit on root level slugs rather than under a folder, so there is
+   no path pattern to filter GA4 on. WordPress is asked which URLs are actually
+   posts, which also gives the real publication dates, and the GA4 page report
+   is then matched against that list. If WordPress cannot be reached the list
+   written into manual.json is used instead. */
+async function listArticles(manual){
+  const out = {};
+  try {
+    const res = await fetch(BLOG_POSTS_URL + '?per_page=100&orderby=date&order=desc&_fields=title,date,link', {
+      headers: { 'User-Agent': 'EK-dashboard/1.2' }
+    });
+    if (res.ok) {
+      const posts = await res.json();
+      (Array.isArray(posts) ? posts : []).forEach(post => {
+        const path = pathOf(post.link);
+        if (!path || path === '/') return;
+        const title = (post.title && post.title.rendered ? post.title.rendered : '')
+          .replace(/<[^>]+>/g, '')
+          .replace(/&#(\d+);/g, (m, n) => String.fromCharCode(+n))
+          .replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ')
+          .replace(/&#8217;|&rsquo;/g, "'").replace(/&#8216;|&lsquo;/g, "'")
+          .replace(/&#8220;|&ldquo;|&#8221;|&rdquo;/g, '"').replace(/&#8211;|&ndash;/g, '-')
+          .trim();
+        const d = new Date(post.date);
+        out[path] = { title, url: post.link, date: isNaN(d) ? '' : dateLabel(d) };
+      });
+    } else {
+      console.error('WordPress posts list -> ' + res.status);
+    }
+  } catch (e) {
+    console.error('WordPress posts list failed:', e.message);
+  }
+
+  // Always fold in anything named by hand, so a page that is not a WordPress
+  // post can still be tracked.
+  (manual.blogs || []).forEach(b => {
+    const path = pathOf(b.url || '');
+    if (!path) return;
+    out[path] = Object.assign({ title: b.title, url: b.url, date: b.date || '' }, out[path] || {});
+  });
+
+  return out;
+}
+
+async function ga4Blogs(today, manual){
+  const articles = await listArticles(manual);
+  if (!Object.keys(articles).length) throw new Error('no article URLs could be found');
+
+  const start = iso(addDays(today, -BLOG_DAYS));
+  const end   = iso(addDays(today, -1));
+  const [rep] = await analytics.runReport({
+    property: `properties/${GA4_PROPERTY_ID}`,
+    dateRanges: [{ startDate: start, endDate: end }],
+    dimensions: [{ name: 'pagePath' }],
+    metrics: [{ name: 'screenPageViews' }, { name: 'userEngagementDuration' }, { name: 'activeUsers' }],
+    orderBys: [{ metric: { metricName: 'screenPageViews' }, desc: true }],
+    limit: 400
+  });
+
+  const rows = [];
+  (rep.rows || []).forEach(r => {
+    const path = r.dimensionValues[0].value.replace(/\?.*$/, '').replace(/#.*$/, '').replace(/\/$/, '');
+    const art = articles[path];
+    if (!art) return;                                  // not an article, skip it
+    const views  = Math.round(+r.metricValues[0].value || 0);
+    const engTot = +r.metricValues[1].value || 0;
+    const users  = +r.metricValues[2].value || 0;
+    rows.push({
+      title: art.title || path,
+      date: art.date || '',
+      views,
+      avgTimeSec: users ? Math.round(engTot / users) : 0,
+      url: art.url || ('https://earlkendrick.com' + path + '/')
+    });
+  });
+
+  return rows.slice(0, BLOG_LIMIT);
 }
 
 /* ---------------------------------------------------------------------------
@@ -431,21 +536,258 @@ function gscIncomplete(period, today){
 }
 
 /* ---------------------------------------------------------------------------
-   LINKEDIN, follower count only
+   LINKEDIN, live
+   ---------------------------------------------------------------------------
+   Three calls against the Community Management API:
+
+     organizationalEntityFollowerStatistics   lifetime count and gains per period
+     organizationalEntityShareStatistics      impressions, clicks and engagement
+     organizationPageStatistics               page views
+
+   The page needs rw_organization_admin and r_organization_social on an app
+   with Community Management API access, and the token must belong to a page
+   admin. Without any of that the manual figures in manual.json are used and
+   the dashboard labels them as typed in rather than measured.
+
+   Follower history is rebuilt by taking the lifetime count and subtracting the
+   gains of every later period, which gives a real month by month series rather
+   than the last known figure carried forward.
    --------------------------------------------------------------------------- */
-async function pullLinkedInFollowers(){
-  if (!LI_TOKEN || !LI_ORG_URN) return null;
-  const urn = encodeURIComponent(LI_ORG_URN);
-  const res = await fetch('https://api.linkedin.com/rest/networkSizes/' + urn + '?edgeType=CompanyFollowedByMember', {
+const LI_BASE = 'https://api.linkedin.com/rest/';
+
+async function refreshLinkedInToken(){
+  if (!LI_REFRESH || !LI_CLIENT || !LI_SECRET) return false;
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: LI_REFRESH,
+    client_id: LI_CLIENT,
+    client_secret: LI_SECRET
+  });
+  const res = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body
+  });
+  if (!res.ok) { console.error('LinkedIn token refresh failed:', res.status, await res.text()); return false; }
+  const data = await res.json();
+  if (!data.access_token) return false;
+  LI_TOKEN = data.access_token;
+  console.log('LinkedIn access token renewed');
+  if (eventsPool) {
+    try {
+      await eventsPool.query(
+        `INSERT INTO ek_store (key, data, updated_at) VALUES ('linkedin_token', $1::jsonb, now())
+         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
+        [JSON.stringify({ access_token: LI_TOKEN, renewedAt: new Date().toISOString() })]
+      );
+    } catch (e) { console.error('Renewed LinkedIn token could not be saved:', e.message); }
+  }
+  return true;
+}
+
+// Read back a token renewed on an earlier run, so a redeploy does not go back
+// to an environment variable that has since expired.
+async function loadSavedLinkedInToken(){
+  if (!eventsPool) return;
+  try {
+    const { rows } = await eventsPool.query(`SELECT data, updated_at FROM ek_store WHERE key = 'linkedin_token'`);
+    if (rows.length && rows[0].data && rows[0].data.access_token) {
+      const savedAt = new Date(rows[0].updated_at).getTime();
+      // Only trust it if it is newer than 55 days, otherwise let the refresh run
+      if (Date.now() - savedAt < 55 * 86400000) LI_TOKEN = rows[0].data.access_token;
+    }
+  } catch (e) { /* table may not exist yet on a first run */ }
+}
+
+async function liGet(path, attempt){
+  const res = await fetch(LI_BASE + path, {
     headers: {
       Authorization: 'Bearer ' + LI_TOKEN,
       'LinkedIn-Version': LI_VERSION,
       'X-Restli-Protocol-Version': '2.0.0'
     }
   });
-  if (!res.ok) throw new Error('LinkedIn networkSizes -> ' + res.status + ' ' + (await res.text()));
-  const data = await res.json();
-  return data.firstDegreeSize != null ? data.firstDegreeSize : null;
+  if (res.status === 401 && !attempt) {
+    const ok = await refreshLinkedInToken();
+    if (ok) return liGet(path, 1);
+  }
+  if (!res.ok) throw new Error('LinkedIn ' + path.split('?')[0] + ' -> ' + res.status + ' ' + (await res.text()).slice(0, 300));
+  return res.json();
+}
+
+const ms = d => new Date(d + 'T00:00:00Z').getTime();
+function timeIntervals(startISO, endISO, granularity){
+  // The end is exclusive in practice, so push it a day on to include the last day
+  const end = new Date(ms(endISO) + 86400000).getTime();
+  return `timeIntervals=(timeRange:(start:${ms(startISO)},end:${end}),timeGranularityType:${granularity})`;
+}
+function monthKeyFromMs(t){
+  const d = new Date(t);
+  return d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1);
+}
+
+// Lifetime follower count. Falls back to the older networkSizes endpoint,
+// which is still served, if the statistics call is not permitted.
+async function liLifetimeFollowers(urn){
+  try {
+    const d = await liGet('organizationalEntityFollowerStatistics?q=organizationalEntity&organizationalEntity=' + encodeURIComponent(urn));
+    const el = (d.elements || [])[0];
+    const t = el && el.totalFollowerCounts;
+    if (t) return (t.organicFollowerCount || 0) + (t.paidFollowerCount || 0);
+  } catch (e) {
+    console.error('Follower statistics unavailable, trying networkSizes:', e.message);
+  }
+  const n = await liGet('../v2/networkSizes/' + encodeURIComponent(urn) + '?edgeType=CompanyFollowedByMember');
+  return n.firstDegreeSize != null ? n.firstDegreeSize : null;
+}
+
+// Follower gains bucketed by period key
+async function liFollowerGains(urn, startISO, endISO, granularity, keyOf){
+  const d = await liGet('organizationalEntityFollowerStatistics?q=organizationalEntity&organizationalEntity=' +
+    encodeURIComponent(urn) + '&' + timeIntervals(startISO, endISO, granularity));
+  const out = {};
+  (d.elements || []).forEach(el => {
+    const g = el.followerGains || {};
+    const gain = (g.organicFollowerGain || 0) + (g.paidFollowerGain || 0);
+    const k = keyOf(el.timeRange && el.timeRange.start);
+    if (k) out[k] = (out[k] || 0) + gain;
+  });
+  return out;
+}
+
+// Impressions, clicks, reactions and engagement, bucketed by period key
+async function liShareStats(urn, startISO, endISO, granularity, keyOf){
+  const d = await liGet('organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=' +
+    encodeURIComponent(urn) + '&' + timeIntervals(startISO, endISO, granularity));
+  const out = {};
+  (d.elements || []).forEach(el => {
+    const t = el.totalShareStatistics || {};
+    const k = keyOf(el.timeRange && el.timeRange.start);
+    if (!k) return;
+    const b = out[k] || (out[k] = { impressions: 0, uniqueImpressions: 0, clicks: 0, reactions: 0, comments: 0, shares: 0 });
+    b.impressions       += t.impressionCount || 0;
+    b.uniqueImpressions += t.uniqueImpressionsCount || 0;
+    b.clicks            += t.clickCount || 0;
+    b.reactions         += t.likeCount || 0;
+    b.comments          += t.commentCount || 0;
+    b.shares            += t.shareCount || 0;
+  });
+  Object.values(out).forEach(b => {
+    const acts = b.clicks + b.reactions + b.comments + b.shares;
+    b.engagementRate = b.impressions ? +(acts / b.impressions * 100).toFixed(2) : 0;
+  });
+  return out;
+}
+
+// Page views, bucketed by period key
+async function liPageViews(urn, startISO, endISO, granularity, keyOf){
+  const d = await liGet('organizationPageStatistics?q=organization&organization=' +
+    encodeURIComponent(urn) + '&' + timeIntervals(startISO, endISO, granularity));
+  const out = {};
+  (d.elements || []).forEach(el => {
+    const k = keyOf(el.timeRange && el.timeRange.start);
+    if (!k) return;
+    const v = el.totalPageStatistics && el.totalPageStatistics.views;
+    let views = 0;
+    if (v) Object.values(v).forEach(x => { if (x && typeof x.pageViews === 'number') views += x.pageViews; });
+    out[k] = (out[k] || 0) + views;
+  });
+  return out;
+}
+
+/* Pulls everything and writes it onto the periods. Anything that fails is
+   reported in the diagnostics and simply leaves that figure to the manual
+   overlay, rather than zeroing it. */
+async function pullLinkedIn(months, weeks){
+  const result = { ok: false, followers: null, error: null, detail: {} };
+  if (!LI_TOKEN || !LI_ORG_URN) {
+    result.error = 'no token or organisation URN set, manual figures in use';
+    return result;
+  }
+
+  await loadSavedLinkedInToken();
+
+  // Lifetime count first. If this fails nothing else will work either.
+  try {
+    result.followers = await liLifetimeFollowers(LI_ORG_URN);
+    result.ok = result.followers != null;
+  } catch (e) {
+    result.error = e.message;
+    return result;
+  }
+
+  const monthKeys = months.map(m => m.key);
+  const weekByDay = {};                       // day key -> week key
+  weeks.forEach(w => {
+    const src = w._range || null;
+    if (!src) return;
+    for (let t = ms(src.start); t <= ms(src.end); t += 86400000) {
+      weekByDay[new Date(t).toISOString().slice(0, 10)] = w.key;
+    }
+  });
+  const dayToWeek = t => weekByDay[new Date(t).toISOString().slice(0, 10)] || null;
+
+  const mStart = months.length ? months[0]._range.start : null;
+  const mEnd   = months.length ? months[months.length - 1]._range.end : null;
+  const wStart = weeks.length ? weeks[0]._range.start : null;
+  const wEnd   = weeks.length ? weeks[weeks.length - 1]._range.end : null;
+
+  // Follower gains
+  try {
+    const gm = mStart ? await liFollowerGains(LI_ORG_URN, mStart, mEnd, 'MONTH', monthKeyFromMs) : {};
+    const gw = wStart ? await liFollowerGains(LI_ORG_URN, wStart, wEnd, 'DAY', dayToWeek) : {};
+    months.forEach(p => { if (gm[p.key] != null) p.linkedinFollowerGain = gm[p.key]; });
+    weeks.forEach(p  => { if (gw[p.key] != null) p.linkedinFollowerGain = gw[p.key]; });
+
+    // Rebuild the follower series backwards from the lifetime count
+    const back = list => {
+      let running = result.followers;
+      for (let i = list.length - 1; i >= 0; i--) {
+        list[i].linkedinFollowers = running;
+        running -= (list[i].linkedinFollowerGain || 0);
+      }
+    };
+    if (result.followers != null) { back(months); back(weeks); }
+    result.detail.gains = Object.keys(gm).length + ' months, ' + Object.keys(gw).length + ' weeks';
+  } catch (e) {
+    result.detail.gains = 'FAILED: ' + e.message;
+    console.error('LinkedIn follower gains failed:', e.message);
+  }
+
+  // Share statistics
+  try {
+    const sm = mStart ? await liShareStats(LI_ORG_URN, mStart, mEnd, 'MONTH', monthKeyFromMs) : {};
+    const sw = wStart ? await liShareStats(LI_ORG_URN, wStart, wEnd, 'DAY', dayToWeek) : {};
+    const apply = (list, map) => list.forEach(p => {
+      const b = map[p.key]; if (!b) return;
+      p.linkedinImpressions = b.impressions;
+      p.linkedinUniqueImpressions = b.uniqueImpressions;
+      p.linkedinClicks = b.clicks;
+      p.linkedinReactions = b.reactions;
+      p.linkedinComments = b.comments;
+      p.linkedinShares = b.shares;
+      p.linkedinEngagementRate = b.engagementRate;
+    });
+    apply(months, sm); apply(weeks, sw);
+    result.detail.shares = Object.keys(sm).length + ' months, ' + Object.keys(sw).length + ' weeks';
+  } catch (e) {
+    result.detail.shares = 'FAILED: ' + e.message;
+    console.error('LinkedIn share statistics failed:', e.message);
+  }
+
+  // Page views
+  try {
+    const pm = mStart ? await liPageViews(LI_ORG_URN, mStart, mEnd, 'MONTH', monthKeyFromMs) : {};
+    const pw = wStart ? await liPageViews(LI_ORG_URN, wStart, wEnd, 'DAY', dayToWeek) : {};
+    months.forEach(p => { if (pm[p.key] != null) p.linkedinPageViews = pm[p.key]; });
+    weeks.forEach(p  => { if (pw[p.key] != null) p.linkedinPageViews = pw[p.key]; });
+    result.detail.pageViews = Object.keys(pm).length + ' months, ' + Object.keys(pw).length + ' weeks';
+  } catch (e) {
+    result.detail.pageViews = 'FAILED: ' + e.message;
+    console.error('LinkedIn page statistics failed:', e.message);
+  }
+
+  return result;
 }
 
 /* ---------------------------------------------------------------------------
@@ -486,6 +828,7 @@ let diag = {
   credentials: CREDS ? 'GOOGLE_CREDENTIALS_JSON' : (process.env.GOOGLE_APPLICATION_CREDENTIALS ? 'GOOGLE_APPLICATION_CREDENTIALS' : 'none set'),
   ga4:      { ok: false, months: 0, weeks: 0, error: null },
   gsc:      { ok: false, periodsWithTerms: 0, error: null },
+  blogs:    { ok: false, count: 0, error: null },
   linkedin: { ok: false, followers: null, error: null },
   manual:   { gbpByPeriod: 0, keys: [] }
 };
@@ -542,20 +885,44 @@ async function buildData(){
     console.error('GSC pull failed:', e.message);
   }
 
-  // ---- LinkedIn followers ----
-  let liFollowers = null;
+  // ---- LinkedIn ----
+  let li = { ok: false, followers: null, error: 'not attempted', detail: {} };
   try {
-    liFollowers = await pullLinkedInFollowers();
-    diag.linkedin = { ok: liFollowers != null, followers: liFollowers, error: liFollowers == null ? 'no token set, manual figures in use' : null };
+    li = await pullLinkedIn(months, weeks);
+    diag.linkedin = { ok: li.ok, followers: li.followers, error: li.error, detail: li.detail };
   } catch (e) {
-    diag.linkedin = { ok: false, followers: null, error: e.message };
+    diag.linkedin = { ok: false, followers: null, error: e.message, detail: {} };
     console.error('LinkedIn pull failed:', e.message);
   }
 
+  /* When the API is not connected, or only partly, the hand written figures in
+     manual.json fill the gaps. Any period the API answered for is left alone. */
   const byMonth = manual.linkedinFollowersByMonth || {};
   const byWeek  = manual.linkedinFollowersByWeek  || {};
-  fillFollowers(months, byMonth, null,    liFollowers);
-  fillFollowers(weeks,  byWeek,  byMonth, liFollowers);
+  if (!li.ok) {
+    fillFollowers(months, byMonth, null,    li.followers);
+    fillFollowers(weeks,  byWeek,  byMonth, li.followers);
+  } else {
+    // Only back fill periods the API had nothing for
+    const gap = list => list.some(p => !p.linkedinFollowers);
+    if (gap(months)) fillFollowers(months, byMonth, null,    null);
+    if (gap(weeks))  fillFollowers(weeks,  byWeek,  byMonth, null);
+  }
+
+  // Mark each period so the dashboard can say which figures were measured
+  const liLive = !!li.ok;
+  months.concat(weeks).forEach(p => { p.linkedinLive = liLive && p.linkedinImpressions != null; });
+
+  // ---- News articles ----
+  let blogs = null;
+  try {
+    blogs = await ga4Blogs(today, manual);
+    diag.blogs = { ok: !!(blogs && blogs.length), count: blogs ? blogs.length : 0, error: null };
+  } catch (e) {
+    blogs = null;
+    diag.blogs = { ok: false, count: 0, error: e.message };
+    console.error('Article views pull failed:', e.message);
+  }
 
   // ---- Assemble ----
   const lastUpdated = `${today.getDate()} ${MON3[today.getMonth()]} ${today.getFullYear()}`;
@@ -563,16 +930,31 @@ async function buildData(){
 
   // Only include automated keys when there is real data behind them, so a failed
   // pull never wipes the figures already written into the dashboard file.
+  months.concat(weeks).forEach(p => { delete p._range; });
+
   if (months.length) out.months = months;
   if (weeks.length)  out.weeks  = weeks;
   if (latestTerms.length) out.searchTerms = latestTerms;
+  if (blogs && blogs.length) out.blogs = blogs;          // live, overrides the manual list below
+  out.linkedinLive = !!(li && li.ok);
+  if (li && li.followers != null) out.linkedinFollowersNow = li.followers;
 
   // Hand authored sections. "linkedin" is deliberately not in this list: the
   // front end owns DASHBOARD.linkedin, the advocacy seed and the best practice
   // cards, and the dashboard merge replaces a whole object rather than deep
   // merging, so sending one from here would wipe them.
   ['blogs','gbp','gbpByPeriod','competitors','competitorOpps','competitorIdeas','shareOfVoice','websiteReview','ideas']
-    .forEach(k => { if (manual[k] != null) out[k] = manual[k]; });
+    .forEach(k => {
+      if (k === 'blogs' && out.blogs) return;            // the live list wins
+      const v = manual[k];
+      if (v == null) return;
+      // An empty array or object from manual.json used to be sent as though it
+      // were real. The dashboard then ignored it and kept its own placeholder,
+      // which is how the article table stayed frozen. Empty means say nothing.
+      if (Array.isArray(v) && !v.length) return;
+      if (typeof v === 'object' && !Array.isArray(v) && !Object.keys(v).length) return;
+      out[k] = v;
+    });
 
   diag.manual = {
     gbpByPeriod: manual.gbpByPeriod ? Object.keys(manual.gbpByPeriod).length : 0,
@@ -585,7 +967,10 @@ async function buildData(){
     builtAt: diag.lastRun,
     ga4: diag.ga4.ok ? `${diag.ga4.months} months, ${diag.ga4.weeks} weeks` : 'FAILED: ' + diag.ga4.error,
     gsc: diag.gsc.ok ? `${diag.gsc.periodsWithTerms} periods with terms` : 'FAILED: ' + diag.gsc.error,
-    linkedin: diag.linkedin.ok ? diag.linkedin.followers : diag.linkedin.error
+    blogs: diag.blogs.ok ? `${diag.blogs.count} articles` : 'FAILED: ' + diag.blogs.error,
+    linkedin: diag.linkedin.ok
+      ? `${diag.linkedin.followers} followers, ` + JSON.stringify(diag.linkedin.detail || {})
+      : diag.linkedin.error
   };
 
   return out;
