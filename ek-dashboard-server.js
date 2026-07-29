@@ -82,12 +82,23 @@ const path = require('path');
 const { BetaAnalyticsDataClient } = require('@google-analytics/data');
 const { google } = require('googleapis');
 
+/* Render runs in UTC. GA4 reports in the property's own timezone, which for
+   Earl Kendrick is UK time, so without this the first and last hours of every
+   month and week land in the wrong period. Set TZ in the Render environment to
+   override. This must happen before any Date is created. */
+process.env.TZ = process.env.TZ || 'Europe/London';
+
 const GA4_PROPERTY_ID = process.env.GA4_PROPERTY_ID || '381171366';
 const GSC_SITE_URL    = process.env.GSC_SITE_URL    || 'https://earlkendrick.com/';
 const PORT            = process.env.PORT || 3000;
 const WEEKS_BACK      = Math.max(2, +(process.env.WEEKS_BACK || 12));
 const MONTHS_BACK     = Math.max(2, +(process.env.MONTHS_BACK || 12));
 const REFRESH_TOKEN   = process.env.REFRESH_TOKEN || '';
+const INCLUDE_CURRENT_MONTH = process.env.INCLUDE_CURRENT_MONTH !== 'false';
+const GSC_ROWS        = Math.max(5, +(process.env.GSC_ROWS || 25));
+// Search Console publishes two to three days behind. Any period ending inside
+// that window is incomplete and is flagged rather than quietly under reported.
+const GSC_LAG_DAYS    = Math.max(0, +(process.env.GSC_LAG_DAYS || 3));
 
 // LinkedIn (optional). Leave the token blank and the manual figures are used.
 const LI_TOKEN   = process.env.LINKEDIN_ACCESS_TOKEN || '';
@@ -100,7 +111,7 @@ const MON3   = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov
 // The six channel labels the dashboard reads. renderActions looks up
 // sources["Email"] and sources["Paid search"] by name, so every period is
 // normalised to carry all six even when a channel had no sessions.
-const CANONICAL_SOURCES = ['Organic search','Direct','Referral','Social','Email','Paid search'];
+const CANONICAL_SOURCES = ['Organic search','Direct','Referral','Social','Email','Paid search','Other'];
 
 /* ---------------------------------------------------------------------------
    CREDENTIALS
@@ -161,6 +172,25 @@ if (DATABASE_URL) {
        )`
     ).then(() => console.log('ek_linkedin table ready'))
      .catch(err => console.error('ek_linkedin table error:', err.message));
+    // The last good payload, so a cold start serves real figures immediately
+    // instead of an empty object.
+    eventsPool.query(
+      `CREATE TABLE IF NOT EXISTS ek_cache (
+         id   integer PRIMARY KEY DEFAULT 1,
+         data jsonb   NOT NULL DEFAULT '{}'::jsonb,
+         saved_at timestamptz NOT NULL DEFAULT now()
+       )`
+    ).then(() => console.log('ek_cache table ready'))
+     .catch(err => console.error('ek_cache table error:', err.message));
+    // Content plan, video library and competitor captures
+    eventsPool.query(
+      `CREATE TABLE IF NOT EXISTS ek_store (
+         key  text PRIMARY KEY,
+         data jsonb NOT NULL DEFAULT '[]'::jsonb,
+         updated_at timestamptz NOT NULL DEFAULT now()
+       )`
+    ).then(() => console.log('ek_store table ready'))
+     .catch(err => console.error('ek_store table error:', err.message));
   } catch (e) {
     console.error('pg not available, /api/events and /api/linkedin disabled (run: npm i pg):', e.message);
     eventsPool = null;
@@ -222,7 +252,11 @@ function buildWeekPeriods(today, count){
   return out;
 }
 
-// The completed months, oldest first, newest last
+/* The completed months, oldest first, newest last, and then the month in
+   progress so the dashboard is never a month behind. Late in July the old
+   version had nothing newer than June on it, which reads as a dashboard that
+   has stopped working. The current month is marked partial and carries the
+   number of days counted so far, so it is never compared as a full month. */
 function buildMonthPeriods(today, count){
   const out = [];
   for (let i = count; i >= 1; i--) {
@@ -233,8 +267,26 @@ function buildMonthPeriods(today, count){
       label: `${MONTHS[first.getMonth()]} ${first.getFullYear()}`,
       short: MON3[first.getMonth()],
       start: iso(first),
-      end:   iso(last)
+      end:   iso(last),
+      daysInPeriod: last.getDate()
     });
+  }
+  if (INCLUDE_CURRENT_MONTH) {
+    const first = new Date(today.getFullYear(), today.getMonth(), 1);
+    const last  = new Date(first.getFullYear(), first.getMonth() + 1, 0);
+    const upto  = addDays(today, -1);                     // yesterday, today is incomplete
+    if (upto >= first) {
+      out.push({
+        key:   `${first.getFullYear()}-${pad2(first.getMonth() + 1)}`,
+        label: `${MONTHS[first.getMonth()]} ${first.getFullYear()}`,
+        short: MON3[first.getMonth()],
+        start: iso(first),
+        end:   iso(upto),
+        partial: true,
+        daysElapsed: upto.getDate(),
+        daysInPeriod: last.getDate()
+      });
+    }
   }
   return out;
 }
@@ -261,24 +313,42 @@ async function mapLimit(items, limit, fn){
    counts unique people and does not add up across days.
    --------------------------------------------------------------------------- */
 function channelLabel(g){
+  /* The previous version folded Paid Social, Display and Cross-network into
+     Paid search. That inflated the paid search figure and hid social ad
+     traffic completely, which is why the channel split never matched GA4.
+     Paid social now sits with social, and anything that is neither search
+     nor a named channel goes to Other rather than being misfiled. */
   const m = {
-    'Organic Search':'Organic search', 'Direct':'Direct', 'Referral':'Referral',
-    'Organic Social':'Social', 'Social':'Social', 'Email':'Email',
-    'Paid Search':'Paid search', 'Paid Social':'Paid search',
-    'Cross-network':'Paid search', 'Display':'Paid search', 'Paid Other':'Paid search',
-    'Organic Video':'Social', 'Affiliates':'Referral'
+    'Organic Search':'Organic search', 'Direct':'Direct',
+    'Referral':'Referral', 'Affiliates':'Referral',
+    'Organic Social':'Social', 'Paid Social':'Social', 'Social':'Social', 'Organic Video':'Social',
+    'Email':'Email', 'SMS':'Email', 'Mobile Push Notifications':'Email',
+    'Paid Search':'Paid search',
+    'Display':'Other', 'Cross-network':'Other', 'Paid Other':'Other',
+    'Paid Video':'Other', 'Paid Shopping':'Other', 'Organic Shopping':'Other',
+    'Audio':'Other', 'Unassigned':'Other'
   };
-  return m[g] || g;
+  return m[g] || 'Other';
 }
 
 async function ga4Period(period){
   const property = `properties/${GA4_PROPERTY_ID}`;
   const dateRanges = [{ startDate: period.start, endDate: period.end }];
 
+  /* activeUsers is what the GA4 reports show by default, so this is the figure
+     that has to match when anyone checks the dashboard against Analytics.
+     totalUsers is carried alongside it for reference. averageSessionDuration
+     was being reported as engaged time, which is a different measure and never
+     agreed with GA4. Engaged time is userEngagementDuration over activeUsers,
+     the same as Average engagement time per active user in the GA4 screens. */
   const [totals] = await analytics.runReport({
     property,
     dateRanges,
-    metrics: [{ name: 'totalUsers' }, { name: 'averageSessionDuration' }]
+    metrics: [
+      { name: 'activeUsers' }, { name: 'totalUsers' },
+      { name: 'userEngagementDuration' }, { name: 'sessions' },
+      { name: 'engagedSessions' }, { name: 'averageSessionDuration' }
+    ]
   });
 
   const [byChannel] = await analytics.runReport({
@@ -289,8 +359,16 @@ async function ga4Period(period){
   });
 
   const row = (totals.rows || [])[0];
-  const users = row ? Math.round(+row.metricValues[0].value) : 0;
-  const engagementSec = row ? Math.round(+row.metricValues[1].value) : 0;
+  const mv = i => row ? (+row.metricValues[i].value || 0) : 0;
+  const activeUsers    = Math.round(mv(0));
+  const totalUsers     = Math.round(mv(1));
+  const engagementTot  = mv(2);
+  const sessions       = Math.round(mv(3));
+  const engagedSess    = Math.round(mv(4));
+  const avgSessionSec  = Math.round(mv(5));
+
+  const users = activeUsers || totalUsers;
+  const engagementSec = activeUsers ? Math.round(engagementTot / activeUsers) : 0;
 
   const sources = {};
   CANONICAL_SOURCES.forEach(k => { sources[k] = 0; });
@@ -304,8 +382,16 @@ async function ga4Period(period){
     key: period.key,
     label: period.label,
     short: period.short,
-    users,
-    engagementSec,
+    users,                        // activeUsers, the GA4 default
+    totalUsers,
+    engagementSec,                // average engagement time per active user
+    avgSessionSec,
+    sessions,                     // the dashboard checks this against the channel split
+    engagedSessions: engagedSess,
+    engagementRate: sessions ? +(engagedSess / sessions * 100).toFixed(1) : 0,
+    partial: !!period.partial,
+    daysElapsed: period.daysElapsed || null,
+    daysInPeriod: period.daysInPeriod || null,
     linkedinFollowers: 0,        // filled from the manual overlay and the live count
     sources
   };
@@ -321,16 +407,27 @@ async function gscPeriod(webmasters, period, rowLimit){
       startDate: period.start,
       endDate: period.end,
       dimensions: ['query'],
-      rowLimit: rowLimit || 12
+      rowLimit: rowLimit || GSC_ROWS
     }
   });
   return (res.data.rows || [])
     .map(r => ({
       term: r.keys[0],
       clicks: Math.round(r.clicks),
+      impressions: Math.round(r.impressions || 0),
+      ctr: +(((r.ctr || 0) * 100).toFixed(2)),
+      // Google already returns position as the average weighted by impressions,
+      // so it is used as given rather than averaged again.
       position: +r.position.toFixed(1)
     }))
     .sort((a, b) => b.clicks - a.clicks);
+}
+
+// True when a period runs close enough to today that Search Console has not
+// finished publishing it.
+function gscIncomplete(period, today){
+  const end = new Date(period.end + 'T00:00:00');
+  return Math.round((startOfDay(today) - end) / 86400000) < GSC_LAG_DAYS;
 }
 
 /* ---------------------------------------------------------------------------
@@ -418,14 +515,18 @@ async function buildData(){
   let latestTerms = [];
   try {
     const webmasters = gscClient();
-    const byPeriod = await mapLimit(allPeriods, 3, p => gscPeriod(webmasters, p, 12));
+    const byPeriod = await mapLimit(allPeriods, 3, p => gscPeriod(webmasters, p, GSC_ROWS));
     const termsByKey = {};
     allPeriods.forEach((p, i) => { termsByKey[p.key] = byPeriod[i] || []; });
 
     let withTerms = 0;
+    const periodByKey = {};
+    allPeriods.forEach(p => { periodByKey[p.key] = p; });
     months.concat(weeks).forEach(p => {
       const t = termsByKey[p.key];
       if (t && t.length) { p.searchTerms = t; withTerms++; }
+      const src = periodByKey[p.key];
+      if (src && gscIncomplete(src, today)) p.searchPartial = true;
     });
 
     // Top level fallback, used by the dashboard only for a period that carries
@@ -458,7 +559,7 @@ async function buildData(){
 
   // ---- Assemble ----
   const lastUpdated = `${today.getDate()} ${MON3[today.getMonth()]} ${today.getFullYear()}`;
-  const out = { lastUpdated };
+  const out = { lastUpdated, generatedAt: new Date().toISOString() };
 
   // Only include automated keys when there is real data behind them, so a failed
   // pull never wipes the figures already written into the dashboard file.
@@ -493,8 +594,54 @@ async function buildData(){
 /* ---------------------------------------------------------------------------
    CACHE AND SCHEDULE
    --------------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+   This is where the dashboard was losing its figures.
+
+   The cache used to live only in memory and was empty until the first build
+   finished. Render puts a free service to sleep after a quarter of an hour
+   idle, so almost every visit woke a cold process, and for the minute or two
+   the rebuild took, /api/ek-dashboard.json answered 200 with an object holding
+   no months and no weeks. The dashboard merged nothing, fell back to the
+   placeholder figures written into the HTML, and showed them as though they
+   were real. Nothing looked broken, the numbers were simply invented.
+
+   The last good payload is now written to Postgres and read back on boot, so a
+   cold start serves real figures straight away and refreshes behind the scenes.
+   --------------------------------------------------------------------------- */
 let cache = { lastUpdated: 'never', _diag: { builtAt: null, ga4: 'not run yet' } };
+let cacheLoaded = false;
 let refreshing = false;
+
+function cacheHasData(c){ return !!(c && ((c.months && c.months.length) || (c.weeks && c.weeks.length))); }
+
+async function loadCache(){
+  if (!eventsPool) return false;
+  try {
+    const { rows } = await eventsPool.query('SELECT data, saved_at FROM ek_cache WHERE id = 1');
+    if (rows.length && cacheHasData(rows[0].data)) {
+      cache = rows[0].data;
+      cache._servedFrom = 'saved payload from ' + new Date(rows[0].saved_at).toISOString();
+      console.log('Cache restored from the database,', (cache.months || []).length, 'months');
+      return true;
+    }
+  } catch (e) {
+    console.error('Cache could not be restored:', e.message);
+  }
+  return false;
+}
+
+async function saveCache(c){
+  if (!eventsPool || !cacheHasData(c)) return;
+  try {
+    await eventsPool.query(
+      `INSERT INTO ek_cache (id, data, saved_at) VALUES (1, $1::jsonb, now())
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, saved_at = now()`,
+      [JSON.stringify(c)]
+    );
+  } catch (e) {
+    console.error('Cache could not be saved:', e.message);
+  }
+}
 
 async function refresh(){
   if (refreshing) return cache;
@@ -503,11 +650,13 @@ async function refresh(){
     const next = await buildData();
     // Never replace a good cache with an empty one. If a refresh comes back with
     // no periods but the last one had some, keep what is already being served.
-    if (!next.months && !next.weeks && (cache.months || cache.weeks)) {
+    if (!cacheHasData(next) && cacheHasData(cache)) {
       console.error('Refresh produced no periods, keeping the previous cache');
       cache = Object.assign({}, cache, { _diag: next._diag });
     } else {
       cache = next;
+      delete cache._servedFrom;
+      await saveCache(cache);
     }
     console.log('Refreshed', cache.lastUpdated, JSON.stringify(cache._diag));
   } catch (e) {
@@ -518,8 +667,25 @@ async function refresh(){
   return cache;
 }
 
-refresh();                              // on boot
-cron.schedule('30 6 * * *', refresh);   // every day at 06:30 server time
+// Serve the saved payload first, then rebuild in the background.
+(async () => {
+  await loadCache();
+  cacheLoaded = true;
+  refresh();
+})();
+
+cron.schedule('30 6 * * *', refresh);   // every day at 06:30 UK time
+
+/* A sleeping service is the reason a cold start ever showed placeholder
+   figures. Pinging itself every ten minutes keeps it awake on Render's free
+   plan. Set SELF_URL to the service address to switch this on, or leave it
+   blank if the service is on a paid plan that does not sleep. */
+const SELF_URL = process.env.SELF_URL || '';
+if (SELF_URL) {
+  setInterval(() => {
+    fetch(SELF_URL.replace(/\/$/, '') + '/health').catch(() => {});
+  }, 10 * 60 * 1000);
+}
 
 /* ---------------------------------------------------------------------------
    SERVE
@@ -527,7 +693,22 @@ cron.schedule('30 6 * * *', refresh);   // every day at 06:30 server time
 const app = express();
 app.use(cors());
 
-app.get('/api/ek-dashboard.json', (_req, res) => res.json(cache));
+app.get('/api/ek-dashboard.json', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  // An empty payload is now said out loud rather than being sent as if it were
+  // a normal answer, so the dashboard can flag it instead of quietly showing
+  // the placeholder figures held in its own file.
+  if (!cacheHasData(cache)) {
+    if (!refreshing) refresh();
+    return res.status(503).json({
+      error: 'no data built yet',
+      building: true,
+      restored: cacheLoaded,
+      _diag: cache._diag || null
+    });
+  }
+  res.json(cache);
+});
 
 // What the last refresh actually managed. Open this first whenever a tab looks
 // stale: it will name the failure rather than leaving you guessing.
@@ -612,8 +793,49 @@ app.put('/api/linkedin', express.json({ limit: '2mb' }), async (req, res) => {
 });
 
 // ---- Status: quick health readout for the shared stores ---------------------
+// ---- Content plan, video library, competitor captures --------------------
+// Same shape as events: GET returns the array, PUT saves the whole array.
+['content', 'videos', 'competitors'].forEach(name => {
+  app.get('/api/' + name, async (_req, res) => {
+    if (!eventsPool) return res.json([]);
+    try {
+      const { rows } = await eventsPool.query('SELECT data FROM ek_store WHERE key = $1', [name]);
+      res.set('Cache-Control', 'no-store');
+      res.json(rows.length ? rows[0].data : []);
+    } catch (e) {
+      console.error('GET /api/' + name, e.message);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  app.put('/api/' + name, express.json({ limit: '8mb' }), async (req, res) => {
+    if (!eventsPool) return res.status(503).json({ ok: false, error: 'no database configured' });
+    if (!Array.isArray(req.body)) return res.status(400).json({ ok: false, error: 'expected an array' });
+    try {
+      await eventsPool.query(
+        `INSERT INTO ek_store (key, data, updated_at) VALUES ($1, $2::jsonb, now())
+         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
+        [name, JSON.stringify(req.body)]
+      );
+      res.json({ ok: true, count: req.body.length });
+    } catch (e) {
+      console.error('PUT /api/' + name, e.message);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+});
+
 app.get('/api/status', async (_req, res) => {
-  const out = { db: !!eventsPool, events: null, linkedin: null };
+  const out = {
+    db: !!eventsPool,
+    events: null,
+    linkedin: null,
+    servingRealData: cacheHasData(cache),
+    servedFrom: cache._servedFrom || 'built in this process',
+    generatedAt: cache.generatedAt || null,
+    months: (cache.months || []).length,
+    weeks: (cache.weeks || []).length
+  };
   if (eventsPool) {
     try {
       const e = await eventsPool.query(`SELECT COALESCE(jsonb_array_length(data),0) AS n FROM ek_events WHERE id = 1`);
@@ -628,4 +850,18 @@ app.get('/api/status', async (_req, res) => {
 });
 
 app.get('/health', (_req, res) => res.send('ok'));
+
+// Row counts for the three newer boards, handy when a tab looks empty
+app.get('/api/status/boards', async (_req, res) => {
+  if (!eventsPool) return res.json({ db: false });
+  const out = { db: true };
+  for (const k of ['content', 'videos', 'competitors']) {
+    try {
+      const r = await eventsPool.query(
+        `SELECT COALESCE(jsonb_array_length(data), 0) AS n, updated_at FROM ek_store WHERE key = $1`, [k]);
+      out[k] = r.rows.length ? { count: r.rows[0].n, updatedAt: r.rows[0].updated_at } : { count: 0, updatedAt: null };
+    } catch (e) { out[k] = { error: e.message }; }
+  }
+  res.json(out);
+});
 app.listen(PORT, () => console.log('EK dashboard data service on :' + PORT));
