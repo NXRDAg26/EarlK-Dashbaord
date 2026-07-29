@@ -427,93 +427,166 @@ async function ga4Period(period){
    out of GA4. Publication dates are not something Analytics knows, so those are
    still taken from manual.json where they exist, matched on the URL.
    --------------------------------------------------------------------------- */
-const BLOG_POSTS_URL = process.env.BLOG_POSTS_URL || 'https://earlkendrick.com/wp-json/wp/v2/posts';
-const BLOG_DAYS      = Math.max(7, +(process.env.BLOG_DAYS || 90));
-const BLOG_LIMIT     = Math.max(3, +(process.env.BLOG_LIMIT || 12));
+const BLOG_SITE   = (process.env.BLOG_SITE || 'https://earlkendrick.com').replace(/\/$/, '');
+const BLOG_DAYS   = Math.max(7, +(process.env.BLOG_DAYS || 90));
+const BLOG_LIMIT  = Math.max(3, +(process.env.BLOG_LIMIT || 12));
 
 const pathOf = u => {
   try { return new URL(u).pathname.replace(/\/$/, '') || '/'; }
   catch (e) { return (u || '').replace(/^https?:\/\/[^/]+/, '').replace(/\/$/, ''); }
 };
 const dateLabel = d => d.getDate() + ' ' + MON3[d.getMonth()] + ' ' + d.getFullYear();
+const decodeHtml = t => (t || '')
+  .replace(/<[^>]+>/g, '')
+  .replace(/&#(\d+);/g, (m, n) => String.fromCharCode(+n))
+  .replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ')
+  .replace(/&#8217;|&rsquo;|&#039;|&apos;/g, "'").replace(/&#8216;|&lsquo;/g, "'")
+  .replace(/&#8220;|&ldquo;|&#8221;|&rdquo;|&quot;/g, '"')
+  .replace(/&#8211;|&ndash;/g, '-').replace(/&#8212;|&mdash;/g, '-')
+  .trim();
 
-/* The articles sit on root level slugs rather than under a folder, so there is
-   no path pattern to filter GA4 on. WordPress is asked which URLs are actually
-   posts, which also gives the real publication dates, and the GA4 page report
-   is then matched against that list. If WordPress cannot be reached the list
-   written into manual.json is used instead. */
+async function grab(url, asText){
+  const res = await fetch(url, { headers: {
+    'User-Agent': 'Mozilla/5.0 (compatible; EK-dashboard/1.3; +https://earlkendrick.com)',
+    'Accept': asText ? 'application/xml,text/xml,*/*' : 'application/json'
+  }, redirect: 'follow' });
+  if (!res.ok) throw new Error(res.status);
+  return asText ? res.text() : res.json();
+}
+
+/* ---------------------------------------------------------------------------
+   FINDING THE ARTICLES
+   ---------------------------------------------------------------------------
+   The blogs sit on root level slugs, so there is no path pattern GA4 can be
+   filtered on and the list of article URLs has to come from the site itself.
+   Asking WordPress for its posts is the first choice because it gives real
+   titles and publication dates, but the REST route can be switched off, the
+   articles can be a custom post type rather than plain posts, and the site may
+   answer on www rather than the bare domain. So several routes are tried in
+   turn and the first that answers is used. Whichever one worked is reported in
+   the diagnostics, so a future failure names itself.
+   --------------------------------------------------------------------------- */
 async function listArticles(manual){
   const out = {};
-  try {
-    const res = await fetch(BLOG_POSTS_URL + '?per_page=100&orderby=date&order=desc&_fields=title,date,link', {
-      headers: { 'User-Agent': 'EK-dashboard/1.2' }
-    });
-    if (res.ok) {
-      const posts = await res.json();
-      (Array.isArray(posts) ? posts : []).forEach(post => {
-        const path = pathOf(post.link);
-        if (!path || path === '/') return;
-        const title = (post.title && post.title.rendered ? post.title.rendered : '')
-          .replace(/<[^>]+>/g, '')
-          .replace(/&#(\d+);/g, (m, n) => String.fromCharCode(+n))
-          .replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ')
-          .replace(/&#8217;|&rsquo;/g, "'").replace(/&#8216;|&lsquo;/g, "'")
-          .replace(/&#8220;|&ldquo;|&#8221;|&rdquo;/g, '"').replace(/&#8211;|&ndash;/g, '-')
-          .trim();
-        const d = new Date(post.date);
-        out[path] = { title, url: post.link, date: isNaN(d) ? '' : dateLabel(d) };
-      });
-    } else {
-      console.error('WordPress posts list -> ' + res.status);
+  const tried = [];
+  const hosts = [BLOG_SITE];
+  if (/^https:\/\/(?!www\.)/.test(BLOG_SITE)) hosts.push(BLOG_SITE.replace('https://', 'https://www.'));
+  else hosts.push(BLOG_SITE.replace('https://www.', 'https://'));
+
+  const addPost = (link, title, dateStr) => {
+    const path = pathOf(link);
+    if (!path || path === '/') return;
+    const d = dateStr ? new Date(dateStr) : null;
+    out[path] = { title: decodeHtml(title), url: link, date: (d && !isNaN(d)) ? dateLabel(d) : '' };
+  };
+
+  // 1 and 2. The WordPress REST API, asking first which post types are public
+  for (const host of hosts) {
+    if (Object.keys(out).length) break;
+    let bases = ['posts'];
+    try {
+      const types = await grab(host + '/wp-json/wp/v2/types', false);
+      const found = Object.values(types || {})
+        .map(t => t && t.rest_base)
+        .filter(b => b && !['pages', 'media', 'blocks', 'menu-items', 'navigation', 'templates', 'template-parts', 'wp_template', 'wp_navigation'].includes(b));
+      if (found.length) bases = [...new Set(found)];
+      tried.push(host + ' types: ' + bases.join(', '));
+    } catch (e) { tried.push(host + ' types failed (' + e.message + ')'); }
+
+    for (const base of bases) {
+      try {
+        const posts = await grab(host + '/wp-json/wp/v2/' + base + '?per_page=100&orderby=date&order=desc&_fields=title,date,link', false);
+        if (Array.isArray(posts) && posts.length) {
+          posts.forEach(pst => addPost(pst.link, pst.title && pst.title.rendered, pst.date));
+          tried.push(host + '/' + base + ': ' + posts.length);
+        }
+      } catch (e) { tried.push(host + '/' + base + ' failed (' + e.message + ')'); }
     }
-  } catch (e) {
-    console.error('WordPress posts list failed:', e.message);
   }
 
-  // Always fold in anything named by hand, so a page that is not a WordPress
-  // post can still be tracked.
+  // 3. The sitemap, if the REST API is closed. Only the post sitemaps are read,
+  //    so ordinary pages such as contact and about are left out.
+  if (!Object.keys(out).length) {
+    for (const host of hosts) {
+      if (Object.keys(out).length) break;
+      for (const root of ['/wp-sitemap.xml', '/sitemap_index.xml', '/sitemap.xml']) {
+        try {
+          const xml = await grab(host + root, true);
+          let maps = (xml.match(/<loc>([^<]+)<\/loc>/g) || []).map(m => m.replace(/<\/?loc>/g, ''));
+          const postMaps = maps.filter(u => /posts-post|post-sitemap|posts?-1|news|insight|blog/i.test(u));
+          const use = postMaps.length ? postMaps : (/<url>/.test(xml) ? [host + root] : []);
+          for (const m of use.slice(0, 6)) {
+            const sub = m === host + root ? xml : await grab(m, true);
+            const blocks = sub.match(/<url>[\s\S]*?<\/url>/g) || [];
+            blocks.forEach(b => {
+              const loc = (b.match(/<loc>([^<]+)<\/loc>/) || [])[1];
+              const mod = (b.match(/<lastmod>([^<]+)<\/lastmod>/) || [])[1];
+              if (loc) addPost(loc, '', mod);
+            });
+          }
+          if (Object.keys(out).length) { tried.push(host + root + ': ' + Object.keys(out).length + ' urls'); break; }
+        } catch (e) { tried.push(host + root + ' failed (' + e.message + ')'); }
+      }
+    }
+  }
+
+  // 4. Anything named by hand always counts, and its title and date win, since
+  //    a person wrote them.
   (manual.blogs || []).forEach(b => {
     const path = pathOf(b.url || '');
     if (!path) return;
-    out[path] = Object.assign({ title: b.title, url: b.url, date: b.date || '' }, out[path] || {});
+    out[path] = Object.assign({}, out[path] || {}, { title: b.title || (out[path] && out[path].title) || '', url: b.url, date: b.date || (out[path] && out[path].date) || '' });
   });
 
-  return out;
+  return { map: out, tried };
 }
 
 async function ga4Blogs(today, manual){
-  const articles = await listArticles(manual);
-  if (!Object.keys(articles).length) throw new Error('no article URLs could be found');
+  const found = await listArticles(manual);
+  const articles = found.map;
+  const howMany = Object.keys(articles).length;
 
   const start = iso(addDays(today, -BLOG_DAYS));
   const end   = iso(addDays(today, -1));
   const [rep] = await analytics.runReport({
     property: `properties/${GA4_PROPERTY_ID}`,
     dateRanges: [{ startDate: start, endDate: end }],
-    dimensions: [{ name: 'pagePath' }],
+    dimensions: [{ name: 'pagePath' }, { name: 'pageTitle' }],
     metrics: [{ name: 'screenPageViews' }, { name: 'userEngagementDuration' }, { name: 'activeUsers' }],
     orderBys: [{ metric: { metricName: 'screenPageViews' }, desc: true }],
-    limit: 400
+    limit: 500
   });
 
   const rows = [];
   (rep.rows || []).forEach(r => {
-    const path = r.dimensionValues[0].value.replace(/\?.*$/, '').replace(/#.*$/, '').replace(/\/$/, '');
+    const path = r.dimensionValues[0].value.replace(/[?#].*$/, '').replace(/\/$/, '');
     const art = articles[path];
-    if (!art) return;                                  // not an article, skip it
+    if (!art) return;
     const views  = Math.round(+r.metricValues[0].value || 0);
     const engTot = +r.metricValues[1].value || 0;
     const users  = +r.metricValues[2].value || 0;
+    // A title from the site is better than one from the browser tab, which
+    // carries the site name on the end.
+    const fromGa = (r.dimensionValues[1].value || '').split('|')[0].split(' - ')[0].trim();
     rows.push({
-      title: art.title || path,
+      title: art.title || fromGa || path,
       date: art.date || '',
       views,
       avgTimeSec: users ? Math.round(engTot / users) : 0,
-      url: art.url || ('https://earlkendrick.com' + path + '/')
+      url: art.url || (BLOG_SITE + path + '/')
     });
   });
 
-  return rows.slice(0, BLOG_LIMIT);
+  // Same article on two paths, for example with and without a trailing slash
+  const merged = {};
+  rows.forEach(r => {
+    const k = r.url;
+    if (merged[k]) { merged[k].views += r.views; }
+    else merged[k] = r;
+  });
+  const list = Object.values(merged).sort((a, b) => b.views - a.views).slice(0, BLOG_LIMIT);
+
+  return { rows: list, sources: found.tried, articleCount: howMany };
 }
 
 /* ---------------------------------------------------------------------------
@@ -651,19 +724,46 @@ async function gApi(url, token){
   try { return JSON.parse(text); } catch (e) { return {}; }
 }
 
-// Work out which listing to read. An explicit id wins, otherwise the first one
-// the authorised account manages is used.
-async function gbpResolveLocation(token){
-  if (GBP_LOCATION_ID) return { id: GBP_LOCATION_ID.replace(/^locations\//, ''), name: null };
-  const accts = await gApi('https://mybusinessaccountmanagement.googleapis.com/v1/accounts', token);
-  const acct = (accts.accounts || [])[0];
-  if (!acct) throw new Error('the authorised Google account manages no Business Profile accounts');
-  const locs = await gApi(
-    'https://mybusinessbusinessinformation.googleapis.com/v1/' + acct.name +
-    '/locations?readMask=name,title&pageSize=10', token);
-  const loc = (locs.locations || [])[0];
-  if (!loc) throw new Error('no locations found on ' + acct.name);
-  return { id: loc.name.replace(/^locations\//, ''), name: loc.title || null, account: acct.name };
+/* Earl Kendrick has offices in several cities, each with its own listing, so
+   reporting only the first one found would understate the whole picture badly.
+   Every listing the authorised account manages is read and the figures added
+   together, with the star rating weighted by how many reviews each listing has.
+
+   Set GBP_LOCATION_ID to a single id, or to several separated by commas, to
+   report on only those. Leave it blank and everything is included. */
+async function gbpResolveLocations(token){
+  if (GBP_LOCATION_ID) {
+    const ids = GBP_LOCATION_ID.split(',').map(x => x.trim().replace(/^locations\//, '')).filter(Boolean);
+    return ids.map(id => ({ id, name: null, account: null }));
+  }
+
+  const accts = await gApi('https://mybusinessaccountmanagement.googleapis.com/v1/accounts?pageSize=20', token);
+  const list = accts.accounts || [];
+  if (!list.length) throw new Error('the authorised Google account manages no Business Profile accounts');
+
+  const out = [];
+  for (const acct of list) {
+    let pageToken = '';
+    for (let page = 0; page < 5; page++) {
+      const url = 'https://mybusinessbusinessinformation.googleapis.com/v1/' + acct.name +
+        '/locations?readMask=name,title,storefrontAddress&pageSize=100' + (pageToken ? '&pageToken=' + pageToken : '');
+      let d;
+      try { d = await gApi(url, token); }
+      catch (e) { console.error('Locations on ' + acct.name + ' could not be read:', e.message); break; }
+      (d.locations || []).forEach(loc => {
+        const city = loc.storefrontAddress && (loc.storefrontAddress.locality || '');
+        out.push({
+          id: loc.name.replace(/^locations\//, ''),
+          name: [loc.title, city].filter(Boolean).join(', ') || loc.name,
+          account: acct.name
+        });
+      });
+      pageToken = d.nextPageToken || '';
+      if (!pageToken) break;
+    }
+  }
+  if (!out.length) throw new Error('no listings found on the authorised account');
+  return out;
 }
 
 function dateParams(prefix, isoDate){
@@ -712,22 +812,51 @@ async function pullGbp(months, weeks){
   const token = await googleAccessToken();
   if (!token) { out.error = 'not connected, authorise at /connect'; return out; }
 
-  let loc;
-  try { loc = await gbpResolveLocation(token); out.location = loc.name || loc.id; }
+  let locs;
+  try { locs = await gbpResolveLocations(token); }
   catch (e) { out.error = e.message; return out; }
+  out.location = locs.length === 1
+    ? (locs[0].name || locs[0].id)
+    : locs.length + ' listings: ' + locs.map(l => l.name || l.id).join(', ');
+  out.locations = locs.length;
 
   const all = months.concat(weeks);
   if (!all.length) { out.error = 'no periods to report on'; return out; }
   const start = all.map(p => p._range.start).sort()[0];
   const end   = all.map(p => p._range.end).sort().slice(-1)[0];
 
-  let byDay;
-  try { byDay = await gbpDaily(token, loc.id, start, end); }
-  catch (e) { out.error = e.message; return out; }
+  // Daily figures from every listing, added together
+  const byDay = {};
+  const failures = [];
+  for (const loc of locs) {
+    try {
+      const one = await gbpDaily(token, loc.id, start, end);
+      Object.keys(one).forEach(day => {
+        const dst = byDay[day] || (byDay[day] = {});
+        Object.keys(one[day]).forEach(m => { dst[m] = (dst[m] || 0) + one[day][m]; });
+      });
+    } catch (e) { failures.push((loc.name || loc.id) + ': ' + e.message); }
+  }
+  if (!Object.keys(byDay).length) {
+    out.error = failures.length ? failures[0] : 'no performance data returned for any listing';
+    return out;
+  }
+  if (failures.length) out.partial = failures;
 
+  // Reviews across every listing, with the rating weighted by review count
   let reviews = { reviews: null, rating: null };
-  try { const r = await gbpReviews(token, loc.account, loc.id); if (r) reviews = r; }
-  catch (e) { console.error('GBP reviews unavailable:', e.message); }
+  let totalReviews = 0, weighted = 0, gotAny = false;
+  for (const loc of locs) {
+    try {
+      const r = await gbpReviews(token, loc.account, loc.id);
+      if (r && r.reviews != null) {
+        gotAny = true;
+        totalReviews += r.reviews;
+        if (r.rating != null) weighted += r.rating * r.reviews;
+      }
+    } catch (e) { console.error('GBP reviews unavailable for ' + (loc.name || loc.id) + ':', e.message); }
+  }
+  if (gotAny) reviews = { reviews: totalReviews, rating: totalReviews ? +(weighted / totalReviews).toFixed(1) : null };
 
   all.forEach(p => {
     const bucket = { views: 0, interactions: 0, breakdown: {} };
@@ -1048,8 +1177,8 @@ let diag = {
   credentials: CREDS ? 'GOOGLE_CREDENTIALS_JSON' : (process.env.GOOGLE_APPLICATION_CREDENTIALS ? 'GOOGLE_APPLICATION_CREDENTIALS' : 'none set'),
   ga4:      { ok: false, months: 0, weeks: 0, error: null },
   gsc:      { ok: false, periodsWithTerms: 0, error: null },
-  blogs:    { ok: false, count: 0, error: null },
-  gbp:      { ok: false, periods: 0, location: null, error: null },
+  blogs:    { ok: false, count: 0, articlesFound: 0, howLooked: [], error: null },
+  gbp:      { ok: false, periods: 0, listings: 0, location: null, partial: null, error: null },
   linkedin: { ok: false, followers: null, error: null },
   manual:   { gbpByPeriod: 0, keys: [] }
 };
@@ -1166,7 +1295,7 @@ async function buildData(){
   let gbp = { ok: false, error: 'not attempted', byPeriod: {}, location: null };
   try {
     gbp = await pullGbp(months, weeks);
-    diag.gbp = { ok: gbp.ok, periods: Object.keys(gbp.byPeriod).length, location: gbp.location, error: gbp.error };
+    diag.gbp = { ok: gbp.ok, periods: Object.keys(gbp.byPeriod).length, listings: gbp.locations || 0, location: gbp.location, partial: gbp.partial || null, error: gbp.error };
   } catch (e) {
     diag.gbp = { ok: false, periods: 0, location: null, error: e.message };
     console.error('Google Business pull failed:', e.message);
@@ -1175,11 +1304,19 @@ async function buildData(){
   // ---- News articles ----
   let blogs = null;
   try {
-    blogs = await ga4Blogs(today, manual);
-    diag.blogs = { ok: !!(blogs && blogs.length), count: blogs ? blogs.length : 0, error: null };
+    const b = await ga4Blogs(today, manual);
+    blogs = b.rows;
+    diag.blogs = {
+      ok: !!(blogs && blogs.length),
+      count: blogs ? blogs.length : 0,
+      articlesFound: b.articleCount,
+      howLooked: b.sources,
+      error: blogs && blogs.length ? null
+        : (b.articleCount ? 'article URLs were found but none of them had views in GA4' : 'no article URLs could be found, see howLooked')
+    };
   } catch (e) {
     blogs = null;
-    diag.blogs = { ok: false, count: 0, error: e.message };
+    diag.blogs = { ok: false, count: 0, articlesFound: 0, howLooked: [], error: e.message };
     console.error('Article views pull failed:', e.message);
   }
 
@@ -1235,7 +1372,7 @@ async function buildData(){
     ga4: diag.ga4.ok ? `${diag.ga4.months} months, ${diag.ga4.weeks} weeks` : 'FAILED: ' + diag.ga4.error,
     gsc: diag.gsc.ok ? `${diag.gsc.periodsWithTerms} periods with terms` : 'FAILED: ' + diag.gsc.error,
     blogs: diag.blogs.ok ? `${diag.blogs.count} articles` : 'FAILED: ' + diag.blogs.error,
-    gbp: diag.gbp.ok ? `${diag.gbp.periods} periods from ${diag.gbp.location}` : 'not live: ' + diag.gbp.error,
+    gbp: diag.gbp.ok ? `${diag.gbp.periods} periods across ${diag.gbp.listings} listing${diag.gbp.listings===1?'':'s'}` : 'not live: ' + diag.gbp.error,
     linkedin: diag.linkedin.ok
       ? `${diag.linkedin.followers} followers, ` + JSON.stringify(diag.linkedin.detail || {})
       : diag.linkedin.error
@@ -1513,7 +1650,11 @@ app.get('/api/status', async (_req, res) => {
    One page with a button for each account. Authorise once and the refresh
    token is stored in the database, so it survives every redeploy.
    --------------------------------------------------------------------------- */
-const LI_SCOPES = 'r_organization_social,rw_organization_admin';
+/* The scopes asked for. If the app has different products approved, override
+   with LINKEDIN_SCOPES rather than editing this file. Asking for a scope the
+   app has not been granted is the usual reason LinkedIn shows its own generic
+   error page before the sign in even starts. */
+const LI_SCOPES = process.env.LINKEDIN_SCOPES || 'r_organization_social,rw_organization_admin';
 const redirectUri = which => (PUBLIC_URL || '') + '/auth/' + which + '/callback';
 
 function page(title, body){
@@ -1593,7 +1734,18 @@ app.get('/auth/google', (_req, res) => {
 
 app.get('/auth/google/callback', async (req, res) => {
   const code = req.query.code;
-  if (!code) return res.status(400).send(page('No code', '<h1>Google did not send an authorisation code.</h1><p>' + (req.query.error || '') + '</p>'));
+  if (!code) {
+    const err = String(req.query.error || '');
+    const why = /access_denied/i.test(err)
+        ? 'The sign in was cancelled, or the account used does not manage the listing. Sign in as the owner of the Business Profile.'
+      : /redirect_uri_mismatch/i.test(err)
+        ? 'The redirect URL does not match the one on the OAuth client in Google Cloud. It must be exactly ' + redirectUri('google')
+      : 'Google refused the request. Check the OAuth client and consent screen are set up on the same Cloud project as the Business Profile APIs.';
+    return res.status(400).send(page('Not authorised',
+      '<h1>Google did not complete the sign in</h1><p>' + why + '</p>' +
+      (err ? '<p>It reported: <code>' + err + '</code></p>' : '') +
+      '<a class="btn grey" href="/connect">Back to connections</a>'));
+  }
   try {
     const r = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
@@ -1617,21 +1769,73 @@ app.get('/auth/google/callback', async (req, res) => {
   }
 });
 
-app.get('/auth/linkedin', (_req, res) => {
-  if (!LI_CLIENT || !PUBLIC_URL) return res.status(400).send(page('Not configured', '<h1>Set LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET and PUBLIC_URL first.</h1>'));
-  const url = 'https://www.linkedin.com/oauth/v2/authorization?' + new URLSearchParams({
+function linkedinAuthUrl(){
+  return 'https://www.linkedin.com/oauth/v2/authorization?' + new URLSearchParams({
     response_type: 'code',
     client_id: LI_CLIENT,
     redirect_uri: redirectUri('linkedin'),
     scope: LI_SCOPES,
     state: 'ek' + Date.now()
   });
-  res.redirect(url);
+}
+
+/* LinkedIn shows its own "something went wrong" page, with no explanation, if
+   any part of the request does not match the app. It never reaches this server,
+   so there is nothing to log. This page shows exactly what is about to be sent
+   so it can be checked against the app settings first. */
+app.get('/auth/linkedin', (req, res) => {
+  if (!LI_CLIENT || !PUBLIC_URL) return res.status(400).send(page('Not configured', '<h1>Set LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET and PUBLIC_URL first.</h1><a class="btn grey" href="/connect">Back</a>'));
+  if (req.query.go === '1') return res.redirect(linkedinAuthUrl());
+
+  res.send(page('Check before signing in', `
+    <h1>Check these three things first</h1>
+    <p class="sub">If any one of them does not match the app, LinkedIn shows a page saying something went wrong and gives no reason. Comparing them here takes a moment and saves a lot of guessing.</p>
+
+    <div class="card">
+      <h2>1. Redirect URL</h2>
+      <p>Open the app at <b>linkedin.com/developers/apps</b>, go to the <b>Auth</b> tab, and check that Authorised redirect URLs contains this, character for character, with no trailing slash:</p>
+      <p><code>${redirectUri('linkedin')}</code></p>
+    </div>
+
+    <div class="card">
+      <h2>2. Client ID</h2>
+      <p>On the same Auth tab, the Client ID should end with:</p>
+      <p><code>...${String(LI_CLIENT).slice(-6)}</code></p>
+      <p>If it does not, the value in Render belongs to a different app.</p>
+    </div>
+
+    <div class="card">
+      <h2>3. Approved products</h2>
+      <p>These permissions are about to be asked for:</p>
+      <p><code>${LI_SCOPES.split(',').join('</code> <code>')}</code></p>
+      <p>Open the <b>Products</b> tab. Community Management API must show <b>Approved</b>. If it says Pending, LinkedIn has not finished reviewing the access request and the sign in cannot work yet, whatever else is set correctly. That is the most common cause by a distance.</p>
+      <p>If the app has been approved for different permissions from the two above, set <code>LINKEDIN_SCOPES</code> in Render to the ones it actually has, comma separated, rather than editing any code.</p>
+    </div>
+
+    <div class="card">
+      <h2>Ready</h2>
+      <p>Sign in as a <b>super admin</b> of the Earl Kendrick page. A manager account is refused.</p>
+      <a class="btn" href="/auth/linkedin?go=1">Continue to LinkedIn</a>
+      <a class="btn grey" href="/connect" style="margin-left:8px">Back</a>
+    </div>`));
 });
 
 app.get('/auth/linkedin/callback', async (req, res) => {
   const code = req.query.code;
-  if (!code) return res.status(400).send(page('No code', '<h1>LinkedIn did not send an authorisation code.</h1><p>' + (req.query.error_description || req.query.error || '') + '</p>'));
+  if (!code) {
+    const err = String(req.query.error || '');
+    const why = /unauthorized_scope/i.test(err)
+        ? 'The app has not been granted these permissions. Community Management API is almost certainly still Pending on the Products tab, so LinkedIn will not issue a token yet.'
+      : /redirect_uri|invalid_request/i.test(err)
+        ? 'The redirect URL does not match the one registered on the app. It has to be identical, including https and any trailing slash.'
+      : /user_cancelled|access_denied/i.test(err)
+        ? 'The sign in was cancelled, or the account used is not a super admin of the page.'
+      : 'LinkedIn refused the request without saying why. Work through the three checks on the previous page.';
+    return res.status(400).send(page('Not authorised',
+      '<h1>LinkedIn did not complete the sign in</h1><p>' + why + '</p>' +
+      (err ? '<p>It reported: <code>' + err + ' ' + (req.query.error_description || '') + '</code></p>' : '') +
+      '<a class="btn grey" href="/auth/linkedin">Back to the checks</a>'));
+  }
   try {
     const r = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
       method: 'POST',
