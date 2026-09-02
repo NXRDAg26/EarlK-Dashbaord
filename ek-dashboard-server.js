@@ -1164,6 +1164,163 @@ function fillFollowers(periods, explicitByKey, monthByKey, live){
 /* ---------------------------------------------------------------------------
    MANUAL OVERLAY
    --------------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+   ENQUIRY EVENTS AND AI VISIBILITY
+   ---------------------------------------------------------------------------
+   Three events fire on the site through Code Snippets, confirmed in GA4
+   Realtime on 27 August 2026:
+
+     email_click    a click on a mailto: link
+     generate_lead  a Gravity Forms submission, on gform_confirmation_loaded
+     phone_click    a tap on a tel: link
+
+   Both queries below ask for the whole span at once with date as a dimension,
+   then the days are added up into periods here. One call each, rather than one
+   per period.
+
+   A period that ended before the snippets went live has no measurement, which
+   is not the same as a measured zero. Those periods are left without the
+   fields entirely so the dashboard shows a dash instead of a confident nought.
+   --------------------------------------------------------------------------- */
+
+const ENQUIRY_EVENTS = {
+  email_click:   'emailClicks',
+  generate_lead: 'formLeads',
+  phone_click:   'phoneClicks'
+};
+
+/* Sources that count as an AI assistant. RE2 syntax, matched case
+   insensitively against sessionSource. Set AI_SOURCE_REGEX in Render to add to
+   it as new assistants appear, rather than editing this file. */
+const AI_SOURCE_REGEX = process.env.AI_SOURCE_REGEX ||
+  '.*(chatgpt|openai|perplexity|gemini\\.google|bard\\.google|copilot|claude\\.ai|anthropic|you\\.com|poe\\.com|deepseek|mistral|phind).*';
+
+const ymd = s => s.slice(0, 4) + '-' + s.slice(4, 6) + '-' + s.slice(6, 8);
+
+function spanOf(ranges){
+  const starts = ranges.map(r => r.start).sort();
+  const ends   = ranges.map(r => r.end).sort();
+  return { start: starts[0], end: ends[ends.length - 1] };
+}
+
+function eachDay(range, fn){
+  for (let t = ms(range.start); t <= ms(range.end); t += 86400000) {
+    fn(new Date(t).toISOString().slice(0, 10));
+  }
+}
+
+async function ga4EnquiryEvents(ranges){
+  const span = spanOf(ranges);
+  const [rep] = await analytics.runReport({
+    property: `properties/${GA4_PROPERTY_ID}`,
+    dateRanges: [{ startDate: span.start, endDate: span.end }],
+    dimensions: [{ name: 'date' }, { name: 'eventName' }],
+    metrics: [{ name: 'eventCount' }],
+    dimensionFilter: {
+      filter: { fieldName: 'eventName', inListFilter: { values: Object.keys(ENQUIRY_EVENTS) } }
+    },
+    limit: 100000
+  });
+
+  const byDay = {};
+  let firstSeen = null;
+  (rep.rows || []).forEach(r => {
+    const day  = ymd(r.dimensionValues[0].value);
+    const name = r.dimensionValues[1].value;
+    const n    = Math.round(+r.metricValues[0].value || 0);
+    if (!n) return;
+    (byDay[day] = byDay[day] || {})[name] = (byDay[day][name] || 0) + n;
+    if (!firstSeen || day < firstSeen) firstSeen = day;
+  });
+  return { byDay, firstSeen, rows: (rep.rows || []).length };
+}
+
+async function ga4AiSessions(ranges){
+  const span = spanOf(ranges);
+  const [rep] = await analytics.runReport({
+    property: `properties/${GA4_PROPERTY_ID}`,
+    dateRanges: [{ startDate: span.start, endDate: span.end }],
+    dimensions: [{ name: 'date' }, { name: 'sessionSource' }],
+    metrics: [{ name: 'sessions' }],
+    dimensionFilter: {
+      filter: {
+        fieldName: 'sessionSource',
+        stringFilter: { matchType: 'FULL_REGEXP', value: AI_SOURCE_REGEX, caseSensitive: false }
+      }
+    },
+    limit: 100000
+  });
+
+  const byDay = {};
+  const sources = {};
+  (rep.rows || []).forEach(r => {
+    const day = ymd(r.dimensionValues[0].value);
+    const src = r.dimensionValues[1].value;
+    const n   = Math.round(+r.metricValues[0].value || 0);
+    byDay[day]   = (byDay[day] || 0) + n;
+    sources[src] = (sources[src] || 0) + n;
+  });
+  return { byDay, sources };
+}
+
+/* AI impressions, best effort.
+
+   Google does not break AI Overviews out as its own dimension in the Search
+   Console API. They are folded into the ordinary web search totals. The one
+   place an appearance type could surface is the searchAppearance dimension, so
+   that is read and anything that names itself as AI or generative is counted.
+   Today this almost always comes back empty, and the tile then falls back to
+   whatever manual.json holds. If Google ever ships the breakdown, the figure
+   starts arriving with no further work. The labels seen are reported in the
+   diagnostics so it is obvious which is happening. */
+async function gscAiAppearance(webmasters, period){
+  const res = await webmasters.searchanalytics.query({
+    siteUrl: GSC_SITE_URL,
+    requestBody: {
+      startDate: period.start, endDate: period.end,
+      dimensions: ['searchAppearance'], rowLimit: 50
+    }
+  });
+  let impressions = 0, clicks = 0;
+  const labels = [];
+  (res.data.rows || []).forEach(r => {
+    const label = r.keys[0] || '';
+    labels.push(label);
+    if (/(^|_)AI(_|$)|GENERATIVE|SGE|OVERVIEW/i.test(label)) {
+      impressions += Math.round(r.impressions || 0);
+      clicks      += Math.round(r.clicks || 0);
+    }
+  });
+  return { impressions, clicks, labels };
+}
+
+function applyEnquiries(periods, events, ai){
+  periods.forEach(p => {
+    if (!p._range) return;
+    let email = 0, form = 0, phone = 0, aiSess = 0;
+    eachDay(p._range, day => {
+      const e = events.byDay[day];
+      if (e) {
+        email += e.email_click   || 0;
+        form  += e.generate_lead || 0;
+        phone += e.phone_click   || 0;
+      }
+      aiSess += ai.byDay[day] || 0;
+    });
+
+    // No measurement before the snippets went live. Leave the fields off.
+    const tracked = events.firstSeen && p._range.end >= events.firstSeen;
+    if (tracked) {
+      p.emailClicks = email;
+      p.formLeads   = form;
+      p.phoneClicks = phone;
+      p.callClicks  = phone;                  // both names, see the note below
+      p.enquiries   = email + form + phone;
+      if (p._range.start < events.firstSeen) p.enquiryPartial = true;
+    }
+    p.aiSessions = aiSess;
+  });
+}
 function readManual(){
   try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'manual.json'), 'utf8')); }
   catch (e) { console.error('manual.json could not be read:', e.message); return {}; }
@@ -1177,6 +1334,7 @@ let diag = {
   credentials: CREDS ? 'GOOGLE_CREDENTIALS_JSON' : (process.env.GOOGLE_APPLICATION_CREDENTIALS ? 'GOOGLE_APPLICATION_CREDENTIALS' : 'none set'),
   ga4:      { ok: false, months: 0, weeks: 0, error: null },
   gsc:      { ok: false, periodsWithTerms: 0, error: null },
+   events:   { ok: false, firstSeen: null, periods: 0, aiSources: [], error: null },
   blogs:    { ok: false, count: 0, articlesFound: 0, howLooked: [], error: null },
   gbp:      { ok: false, periods: 0, listings: 0, location: null, partial: null, error: null },
   linkedin: { ok: false, followers: null, error: null },
@@ -1234,7 +1392,51 @@ async function buildData(){
     diag.gsc = { ok: false, periodsWithTerms: 0, error: e.message };
     console.error('GSC pull failed:', e.message);
   }
+  // ---- Enquiry events and AI visibility ----
+  try {
+    const live = months.concat(weeks).filter(p => p._range);
+    if (!live.length) throw new Error('no periods were built, so there is nothing to attach events to');
 
+    const ranges = live.map(p => p._range);
+    const [events, ai] = await Promise.all([
+      ga4EnquiryEvents(ranges),
+      ga4AiSessions(ranges)
+    ]);
+    applyEnquiries(live, events, ai);
+
+    // AI impressions, if Search Console ever exposes them
+    let appearanceLabels = [];
+    try {
+      const webmasters = gscClient();
+      const newest = live[live.length - 1];
+      const seen = await gscAiAppearance(webmasters, newest._range);
+      appearanceLabels = seen.labels;
+      if (seen.impressions > 0) {
+        const perPeriod = await mapLimit(live, 3, p => gscAiAppearance(webmasters, p._range));
+        live.forEach((p, i) => {
+          if (perPeriod[i] && perPeriod[i].impressions > 0) {
+            p.aiImpressions = perPeriod[i].impressions;
+            if (perPeriod[i].clicks > 0) p.aiClicks = perPeriod[i].clicks;
+          }
+        });
+      }
+    } catch (e) {
+      console.error('AI appearance check failed:', e.message);
+    }
+
+    diag.events = {
+      ok: !!events.firstSeen,
+      firstSeen: events.firstSeen,
+      periods: live.filter(p => p.emailClicks != null).length,
+      aiSources: Object.keys(ai.sources),
+      searchAppearance: appearanceLabels,
+      error: events.firstSeen ? null
+        : 'GA4 returned no rows for email_click, generate_lead or phone_click across the whole span'
+    };
+  } catch (e) {
+    diag.events = { ok: false, firstSeen: null, periods: 0, aiSources: [], error: e.message };
+    console.error('Enquiry events pull failed:', e.message);
+  }
   // ---- LinkedIn ----
   let li = { ok: false, followers: null, error: 'not attempted', detail: {} };
   try {
@@ -1371,6 +1573,9 @@ async function buildData(){
     builtAt: diag.lastRun,
     ga4: diag.ga4.ok ? `${diag.ga4.months} months, ${diag.ga4.weeks} weeks` : 'FAILED: ' + diag.ga4.error,
     gsc: diag.gsc.ok ? `${diag.gsc.periodsWithTerms} periods with terms` : 'FAILED: ' + diag.gsc.error,
+   events: diag.events.ok
+      ? `${diag.events.periods} periods, tracking from ${diag.events.firstSeen}`
+      : 'not live: ' + diag.events.error,
     blogs: diag.blogs.ok ? `${diag.blogs.count} articles` : 'FAILED: ' + diag.blogs.error,
     gbp: diag.gbp.ok ? `${diag.gbp.periods} periods across ${diag.gbp.listings} listing${diag.gbp.listings===1?'':'s'}` : 'not live: ' + diag.gbp.error,
     linkedin: diag.linkedin.ok
