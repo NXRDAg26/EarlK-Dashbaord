@@ -1189,6 +1189,26 @@ const ENQUIRY_EVENTS = {
   phone_click:   'phoneClicks'
 };
 
+/* form_submit is GA4's own enhanced measurement event, not one of ours. It has
+   been recording all along, which is why the site shows submissions that
+   generate_lead does not. It is pulled separately from the three above for two
+   reasons.
+
+   First, it fires on every form on the page, so newsletter and search boxes
+   land in it too and it reads slightly high against real enquiries. The
+   dashboard prefers generate_lead whenever that returns a positive number and
+   only falls back to this.
+
+   Second, and this is the one that would have bitten: firstSeen below is what
+   decides whether a period was measured at all. form_submit predates the
+   snippets by months, so folding it into the same map would drag firstSeen back
+   to the start of the year and make every earlier period report a confident
+   nought for email and phone clicks that were never actually tracked. It is
+   counted here but deliberately kept out of that calculation. */
+const AUTO_EVENTS = {
+  form_submit: 'formSubmits'
+};
+
 /* Sources that count as an AI assistant. RE2 syntax, matched case
    insensitively against sessionSource. Set AI_SOURCE_REGEX in Render to add to
    it as new assistants appear, rather than editing this file. */
@@ -1217,7 +1237,8 @@ async function ga4EnquiryEvents(ranges){
     dimensions: [{ name: 'date' }, { name: 'eventName' }],
     metrics: [{ name: 'eventCount' }],
     dimensionFilter: {
-      filter: { fieldName: 'eventName', inListFilter: { values: Object.keys(ENQUIRY_EVENTS) } }
+      filter: { fieldName: 'eventName', inListFilter: {
+        values: Object.keys(ENQUIRY_EVENTS).concat(Object.keys(AUTO_EVENTS)) } }
     },
     limit: 100000
   });
@@ -1230,7 +1251,8 @@ async function ga4EnquiryEvents(ranges){
     const n    = Math.round(+r.metricValues[0].value || 0);
     if (!n) return;
     (byDay[day] = byDay[day] || {})[name] = (byDay[day][name] || 0) + n;
-    if (!firstSeen || day < firstSeen) firstSeen = day;
+    // Only the snippet events set firstSeen. See the note on AUTO_EVENTS.
+    if (ENQUIRY_EVENTS[name] && (!firstSeen || day < firstSeen)) firstSeen = day;
   });
   return { byDay, firstSeen, rows: (rep.rows || []).length };
 }
@@ -1297,13 +1319,14 @@ async function gscAiAppearance(webmasters, period){
 function applyEnquiries(periods, events, ai){
   periods.forEach(p => {
     if (!p._range) return;
-    let email = 0, form = 0, phone = 0, aiSess = 0;
+    let email = 0, form = 0, phone = 0, submit = 0, aiSess = 0;
     eachDay(p._range, day => {
       const e = events.byDay[day];
       if (e) {
-        email += e.email_click   || 0;
-        form  += e.generate_lead || 0;
-        phone += e.phone_click   || 0;
+        email  += e.email_click   || 0;
+        form   += e.generate_lead || 0;
+        phone  += e.phone_click   || 0;
+        submit += e.form_submit   || 0;
       }
       aiSess += ai.byDay[day] || 0;
     });
@@ -1313,9 +1336,14 @@ function applyEnquiries(periods, events, ai){
     if (tracked) {
       p.emailClicks = email;
       p.formLeads   = form;
+      p.formSubmits = submit;
       p.phoneClicks = phone;
       p.callClicks  = phone;                  // both names, see the note below
-      p.enquiries   = email + form + phone;
+      // A flat zero from generate_lead is the snippet not firing, not an
+      // absence of enquiries, so a real form_submit count stands in for it.
+      // Same rule the dashboard applies, kept identical here so the server
+      // total and the card total can never disagree.
+      p.enquiries   = email + (form > 0 ? form : submit) + phone;
       if (p._range.start < events.firstSeen) p.enquiryPartial = true;
     }
     p.aiSessions = aiSess;
@@ -1430,6 +1458,8 @@ async function buildData(){
       periods: live.filter(p => p.emailClicks != null).length,
       aiSources: Object.keys(ai.sources),
       searchAppearance: appearanceLabels,
+      formSubmits: live.filter(p => p.formSubmits != null).length,
+      leadsFallingBack: live.some(p => p.formSubmits > 0 && !(p.formLeads > 0)),
       error: events.firstSeen ? null
         : 'GA4 returned no rows for email_click, generate_lead or phone_click across the whole span'
     };
