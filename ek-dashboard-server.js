@@ -1209,9 +1209,27 @@ const AUTO_EVENTS = {
   form_submit: 'formSubmits'
 };
 
-/* Sources that count as an AI assistant. RE2 syntax, matched case
-   insensitively against sessionSource. Set AI_SOURCE_REGEX in Render to add to
-   it as new assistants appear, rather than editing this file. */
+/* Sources that count as an AI assistant.
+
+   This regex is now the FALLBACK rather than the primary signal. On 13 May 2026
+   Google added a native AI Assistant channel to GA4's default channel group,
+   reaching general availability around 7 June. Qualifying sessions are tagged
+   medium = ai-assistant automatically, with no configuration, and Google
+   maintains the list of recognised assistants itself. That is strictly better
+   than a hand-kept regex that goes stale every time a new assistant appears or
+   changes domain.
+
+   The regex still matters for history. Months before June 2026 predate the
+   channel, and those sessions sit in Referral with their original source, so
+   dropping the regex would blank out every earlier period. Both are matched,
+   in one OR group, and a session that satisfies both is still a single row.
+
+   Worth knowing when reading the two AI tiles together: Google excludes AI
+   Overviews and AI Mode from this channel and counts them under Organic Search.
+   So AI impressions and visits from AI assistants are measuring genuinely
+   different things, not two views of the same one.
+
+   Set AI_SOURCE_REGEX in Render to extend the fallback for older periods. */
 const AI_SOURCE_REGEX = process.env.AI_SOURCE_REGEX ||
   '.*(chatgpt|openai|perplexity|gemini\\.google|bard\\.google|copilot|claude\\.ai|anthropic|you\\.com|poe\\.com|deepseek|mistral|phind).*';
 
@@ -1262,12 +1280,20 @@ async function ga4AiSessions(ranges){
   const [rep] = await analytics.runReport({
     property: `properties/${GA4_PROPERTY_ID}`,
     dateRanges: [{ startDate: span.start, endDate: span.end }],
-    dimensions: [{ name: 'date' }, { name: 'sessionSource' }],
+    dimensions: [{ name: 'date' }, { name: 'sessionSource' }, { name: 'sessionMedium' }],
     metrics: [{ name: 'sessions' }],
     dimensionFilter: {
-      filter: {
-        fieldName: 'sessionSource',
-        stringFilter: { matchType: 'FULL_REGEXP', value: AI_SOURCE_REGEX, caseSensitive: false }
+      orGroup: {
+        expressions: [
+          { filter: {
+              fieldName: 'sessionMedium',
+              stringFilter: { matchType: 'EXACT', value: 'ai-assistant', caseSensitive: false }
+          } },
+          { filter: {
+              fieldName: 'sessionSource',
+              stringFilter: { matchType: 'FULL_REGEXP', value: AI_SOURCE_REGEX, caseSensitive: false }
+          } }
+        ]
       }
     },
     limit: 100000
@@ -1275,14 +1301,19 @@ async function ga4AiSessions(ranges){
 
   const byDay = {};
   const sources = {};
+  let viaChannel = 0, viaRegex = 0;
   (rep.rows || []).forEach(r => {
     const day = ymd(r.dimensionValues[0].value);
     const src = r.dimensionValues[1].value;
+    const med = r.dimensionValues[2].value;
     const n   = Math.round(+r.metricValues[0].value || 0);
     byDay[day]   = (byDay[day] || 0) + n;
     sources[src] = (sources[src] || 0) + n;
+    // Which signal caught it, so the diagnostics can show the channel taking
+    // over from the regex as the older months age out.
+    if (med && med.toLowerCase() === 'ai-assistant') viaChannel += n; else viaRegex += n;
   });
-  return { byDay, sources };
+  return { byDay, sources, viaChannel, viaRegex };
 }
 
 /* AI impressions, best effort.
@@ -1457,6 +1488,8 @@ async function buildData(){
       firstSeen: events.firstSeen,
       periods: live.filter(p => p.emailClicks != null).length,
       aiSources: Object.keys(ai.sources),
+      aiViaChannel: ai.viaChannel,        // GA4's own ai-assistant medium
+      aiViaRegex: ai.viaRegex,            // caught by the fallback regex only
       searchAppearance: appearanceLabels,
       formSubmits: live.filter(p => p.formSubmits != null).length,
       leadsFallingBack: live.some(p => p.formSubmits > 0 && !(p.formLeads > 0)),
