@@ -593,6 +593,78 @@ module.exports = function mountExtras(app, ctx){
     });
   });
 
+  /* Simple control page with buttons, so nothing needs typing into a console.
+     The key is typed once and kept for this browser tab only. */
+  app.get('/admin', (_req, res) => {
+    res.send(page('EK dashboard controls', `
+      <h1>EK dashboard controls</h1>
+      <p class="sub">Type your admin key once, then use the buttons.</p>
+      <div class="card">
+        <h2>Admin key</h2>
+        <p>The ADMIN_KEY you set in Render.</p>
+        <input id="k" type="password" autocomplete="off" style="width:100%;padding:10px;border:1px solid #E3EAF2;border-radius:10px;font-size:15px;box-sizing:border-box">
+      </div>
+      <div class="card">
+        <h2>AI visibility</h2>
+        <p>Asks the AI engines the buyer questions and records whether Earl Kendrick is named and cited. Takes about five minutes.</p>
+        <a class="btn" href="#" data-act="ai">Run the AI check now</a>
+        <p id="ai-out" style="margin-top:12px"></p>
+      </div>
+      <div class="card">
+        <h2>Weekly LinkedIn email</h2>
+        <p>See the email as it would look this week, or send a test to james@nx-rd.com only. Nothing goes to Chelsea from here.</p>
+        <a class="btn grey" href="#" data-act="preview">Preview the email</a>
+        <a class="btn" href="#" data-act="test" style="margin-left:8px">Send me a test</a>
+        <p id="mail-out" style="margin-top:12px"></p>
+      </div>
+      <div class="card">
+        <h2>Current state</h2>
+        <p id="state">Loading...</p>
+      </div>
+      <script>
+        const k = document.getElementById('k');
+        try { k.value = sessionStorage.getItem('ekKey') || ''; } catch (e) {}
+        k.addEventListener('input', () => { try { sessionStorage.setItem('ekKey', k.value); } catch (e) {} });
+        const say = (id, msg, bad) => { const el = document.getElementById(id); el.textContent = msg; el.style.color = bad ? '#D2483B' : '#132234'; };
+        const need = id => { if (!k.value) { say(id, 'Type the admin key at the top first.', true); return false; } return true; };
+        async function call(url, id){
+          say(id, 'Working...');
+          try {
+            const r = await fetch(url + '?key=' + encodeURIComponent(k.value), { method: 'POST' });
+            const t = await r.text(); let j = null; try { j = JSON.parse(t); } catch (e) {}
+            if (!r.ok) return say(id, r.status === 401 ? 'That key does not match the one in Render.' : (j && j.error) || t, true);
+            return j;
+          } catch (e) { say(id, 'Could not reach the service: ' + e.message, true); }
+        }
+        document.querySelectorAll('[data-act]').forEach(b => b.addEventListener('click', async ev => {
+          ev.preventDefault();
+          const act = b.dataset.act;
+          if (act === 'preview') { if (need('mail-out')) window.open('/api/weekly-email/preview?key=' + encodeURIComponent(k.value), '_blank'); return; }
+          if (act === 'test') {
+            if (!need('mail-out')) return;
+            const j = await call('/api/weekly-email/send', 'mail-out');
+            if (j) say('mail-out', j.ok ? 'Sent to ' + j.to.join(', ') + '. Check your inbox.' : (j.error || 'Not sent'), !j.ok);
+          }
+          if (act === 'ai') {
+            if (!need('ai-out')) return;
+            const j = await call('/api/ai-citations/run', 'ai-out');
+            if (j) say('ai-out', 'Started with ' + j.engines.join(', ') + '. Give it about five minutes, then refresh this page.');
+          }
+        }));
+        Promise.all([fetch('/api/weekly-email/status').then(r => r.json()), fetch('/api/ai-citations.json').then(r => r.json())])
+          .then(([m, a]) => {
+            const lines = [
+              'Weekly email to Chelsea: ' + (m.enabled ? 'ON' : 'off (turn on with WEEKLY_EMAIL_ENABLED in Render)'),
+              'Email settings: ' + (m.smtpConfigured ? 'set' : 'missing'),
+              'Last email sent: ' + (m.lastSent ? new Date(m.lastSent.sentAt).toLocaleString('en-GB') : 'none yet'),
+              'AI engines: ' + (a.engines.join(', ') || 'none, add an API key in Render'),
+              'Latest AI check: ' + (a.latest ? new Date(a.latest.date).toLocaleString('en-GB') + ', named in ' + a.latest.mentionRate + '% and cited in ' + a.latest.citationRate + '% of answers' : 'not run yet')
+            ];
+            document.getElementById('state').innerHTML = lines.map(l => l.replace(/&/g,'&amp;').replace(/</g,'&lt;')).join('<br>');
+          }).catch(() => say('state', 'Could not load the current state.', true));
+      </script>`));
+  });
+
   const tz = { timezone: 'Europe/London' };
   cron.schedule(process.env.AI_AUDIT_CRON || '12 7 * * 1', () => { runAudit(); }, tz);
   cron.schedule(process.env.WEEKLY_EMAIL_CRON || '12 8 * * 1', () => {
