@@ -124,7 +124,7 @@ function normaliseOrgUrn(raw){
   return '';
 }
 const LI_ORG_URN  = normaliseOrgUrn(process.env.LINKEDIN_ORG_URN);
-const LI_VERSION  = process.env.LINKEDIN_API_VERSION || '202606';
+const LI_VERSION  = process.env.LINKEDIN_API_VERSION || '202610';
 
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 const MON3   = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -2132,6 +2132,17 @@ app.get('/auth/linkedin/callback', async (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.send('ok'));
+
+/* ---------------------------------------------------------------------------
+   EXTRAS: weekly LinkedIn email and the live AI visibility audit.
+   Everything is in ek-extras.js, see the notes at the top of that file.
+   --------------------------------------------------------------------------- */
+require('./ek-extras')(app, {
+  cron, liGet, storeGet, storePut, readManual, page,
+  getCache: () => cache,
+  getLinkedIn: () => ({ token: LI_TOKEN, org: LI_ORG_URN }),
+  loadLinkedInToken: loadSavedLinkedInToken
+});
 
 // Row counts for the three newer boards, handy when a tab looks empty
 app.get('/api/status/boards', async (_req, res) => {
